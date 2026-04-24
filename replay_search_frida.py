@@ -16,17 +16,41 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 import sys
 import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from replay_search import (
-    DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
-    TIKTOK_HOST, TIKTOK_PATH,
-    build_query, safe_kw,
-)
+from replay_search import build_query as _build_query_v1, safe_kw
+if os.environ.get("TIKTOK_ACCOUNT") == "vm3":
+    from replay_search_vm3 import (
+        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
+        TIKTOK_HOST, TIKTOK_PATH, SEARCH_PARAM_ORDER,
+    )
+    # build_query in replay_search.py uses module-level DEVICE; for VM-3
+    # rebuild it locally so it picks up VM-3's DEVICE.
+    import time as _time, urllib.parse as _up
+    def build_query(keyword: str, cursor: int, count: int = 30) -> str:
+        now_ms = int(_time.time() * 1000); now_s = now_ms // 1000
+        params = {
+            "cursor": str(cursor), "sort_type": "1",
+            "enter_from": "homepage_hot", "count": str(count),
+            "source": "video_search", "keyword": keyword,
+            "query_correct_type": "0", "is_filter_search": "1",
+            "search_source": "tab_search", "search_id": "",
+            "request_tag_from": "h5", "_rticket": str(now_ms),
+            "ts": str(now_s), **DEVICE,
+        }
+        pairs = [(k, params[k]) for k in SEARCH_PARAM_ORDER]
+        return _up.urlencode(pairs, quote_via=_up.quote_plus)
+else:
+    from replay_search import (
+        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
+        TIKTOK_HOST, TIKTOK_PATH,
+    )
+    build_query = _build_query_v1
 from frida_signer import FridaSigner
 
 

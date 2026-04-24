@@ -50,6 +50,7 @@ def _load_signer_module():
 NTFY_TOPIC = "retardedjames-tiktok"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "http://150.136.40.239:2586")
 NTFY_URL = f"{NTFY_SERVER}/{NTFY_TOPIC}"
+NTFY_PREFIX = os.environ.get("NTFY_PREFIX", "")  # e.g. "[vm3]" to distinguish workers
 
 MAX_PAGES_DEFAULT = 50
 LIKE_FLOOR_DEFAULT = 1000
@@ -72,6 +73,10 @@ def ntfy(message: str, *, title: str | None = None, priority: str | None = None)
     """Best-effort push to ntfy.sh. Never raises — a notification failure
     must not kill the scraper."""
     try:
+        if NTFY_PREFIX:
+            message = f"{NTFY_PREFIX} {message}"
+            if title:
+                title = f"{NTFY_PREFIX} {title}"
         data = message.encode("utf-8")
         headers = {}
         if title:

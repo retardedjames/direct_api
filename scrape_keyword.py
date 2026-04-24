@@ -40,14 +40,16 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from replay_search import (
-    DEVICE,
-    USER_AGENT,
-    COOKIE,
-    X_TT_TOKEN,
-    TIKTOK_HOST,
-    TIKTOK_PATH,
-)
+if os.environ.get("TIKTOK_ACCOUNT") == "vm3":
+    from replay_search_vm3 import (
+        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
+        TIKTOK_HOST, TIKTOK_PATH,
+    )
+else:
+    from replay_search import (
+        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
+        TIKTOK_HOST, TIKTOK_PATH,
+    )
 from frida_signer import FridaSigner
 
 PAGE_SIZE = 30

@@ -5,6 +5,10 @@ __pycache__/
 # 1.8MB binary, easy to re-extract from Waydroid
 libs/libmetasec_ov.so
 
+# 23MB TT Lite split-APK bundle, staged here for copying to new Waydroid VMs.
+# Don't commit — public repo, and these aren't our bits to redistribute.
+ttapk/*.apk
+
 # Oracle dumps contain real session cookies and RapidAPI-signed headers; keep local
 oracles/*.json
 
@@ -16,3 +20,8 @@ traces/*.log
 captured_*.json
 captured_*.jsonl
 full_capture.jsonl
+
+# Per-VM identity files (live cookies + tokens for a single account/device).
+# Unlike replay_search.py (VM-1, user opted in to committing), these are kept
+# local to each scraper VM. One file per VM in production.
+replay_search_vm*.py
