@@ -1,0 +1,156 @@
+"""
+replay_search_frida.py — like replay_search.py, but signs locally via the
+live TikTok Lite process on the ARM VM (Frida RPC), instead of burning
+RapidAPI quota.
+
+Must be run on the ARM VM that has `adb` + frida-server + TT Lite running.
+See HANDOFF.md for bootstrap steps.
+
+Usage:
+  python3 replay_search_frida.py mario
+  python3 replay_search_frida.py "kawaii desk" --cursor 0
+"""
+
+from __future__ import annotations
+
+import argparse
+import gzip
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from replay_search import (
+    DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
+    TIKTOK_HOST, TIKTOK_PATH,
+    build_query, safe_kw,
+)
+from frida_signer import FridaSigner
+
+
+SIGNER = FridaSigner()
+
+
+def base_headers() -> dict[str, str]:
+    """The request headers TT sends with /search/item/ BEFORE signing.
+
+    These are the inputs the MSSDK signer sees; X-Argus/X-Ladon/X-Gorgon/
+    X-Khronos are what it adds. Must match replay_search.call_tiktok's
+    header set (minus the signer output).
+    """
+    return {
+        "rpc-persist-pyxis-policy-state-law-is-ca": "0",
+        "rpc-persist-pyxis-policy-v-tnc": "1",
+        "x-ss-dp": "1340",
+        "x-tt-request-tag": "n=0",
+        "x-tt-pba-enable": "1",
+        "sdk-version": "2",
+        "x-tt-dm-status": "login=1;ct=1;",
+        "x-tt-token": X_TT_TOKEN,
+        "passport-sdk-version": "1",
+        "x-tt-ultra-lite": "1",
+        "x-tt-store-region": "us",
+        "x-tt-store-region-src": "uid",
+        "x-vc-bdturing-sdk-version": "2.3.15.i18n",
+        "ttzip-tlb": "1",
+        "accept-encoding": "gzip, ttzip",
+        "user-agent": USER_AGENT,
+        "cookie": COOKIE,
+    }
+
+
+def call_tiktok(query: str, sig: dict) -> tuple[int, bytes, dict]:
+    url = f"https://{TIKTOK_HOST}{TIKTOK_PATH}?{query}"
+    headers = dict(base_headers())
+    headers["x-argus"]   = sig.get("X-Argus", "")
+    headers["x-ladon"]   = sig.get("X-Ladon", "")
+    headers["x-gorgon"]  = sig.get("X-Gorgon", "")
+    headers["x-khronos"] = sig.get("X-Khronos", "")
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read()
+            status = resp.status
+            resp_headers = dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        status = e.code
+        resp_headers = dict(e.headers) if e.headers else {}
+    if resp_headers.get("Content-Encoding", "").lower() == "gzip":
+        raw = gzip.decompress(raw)
+    return status, raw, resp_headers
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("keyword")
+    ap.add_argument("--cursor", type=int, default=0)
+    ap.add_argument("--count", type=int, default=30)
+    args = ap.parse_args()
+
+    query = build_query(args.keyword, args.cursor, args.count)
+    url = f"https://{TIKTOK_HOST}{TIKTOK_PATH}?{query}"
+    print(f"[query] {query[:200]}...", file=sys.stderr)
+
+    t0 = time.time()
+    sig = SIGNER.sign_request(url, base_headers())
+    print(f"[sig] {list(sig.keys())} in {(time.time()-t0)*1000:.0f}ms "
+          f"(cached_ts={SIGNER.cached_ts()})", file=sys.stderr)
+
+    status, body, hdrs = call_tiktok(query, sig)
+    print(f"[tiktok] status={status} bytes={len(body)}", file=sys.stderr)
+
+    trace_path = Path(f"/tmp/replay_frida_{safe_kw(args.keyword)}_{args.cursor}.json")
+    try:
+        parsed = json.loads(body)
+        body_preview = json.dumps(parsed)[:400]
+    except Exception:
+        parsed = None
+        body_preview = body[:400].decode("utf-8", "replace")
+
+    trace = {
+        "query": query,
+        "sig": sig,
+        "resp_status": status,
+        "resp_headers": hdrs,
+        "resp_body_preview": body_preview,
+    }
+    if parsed is not None:
+        aweme = parsed.get("aweme_list") or []
+        trace["aweme_count"] = len(aweme)
+        trace["status_code"] = parsed.get("status_code")
+        trace["status_msg"] = parsed.get("status_msg")
+        trace["server_stream_time_ms"] = (parsed.get("extra") or {}).get("server_stream_time")
+        if aweme:
+            first = aweme[0]
+            stats = first.get("statistics") or {}
+            trace["first_item"] = {
+                "aweme_id": first.get("aweme_id"),
+                "desc": (first.get("desc") or "")[:120],
+                "digg_count": stats.get("digg_count"),
+                "play_count": stats.get("play_count"),
+            }
+    trace_path.write_text(json.dumps(trace, indent=2))
+    print(f"[trace] wrote {trace_path}", file=sys.stderr)
+
+    # One-line verdict. The silent-reject pattern is HTTP 200 + aweme_list=null
+    # + server_stream_time ~80ms. Accepted signatures return populated aweme_list
+    # with server_stream_time >200ms.
+    if parsed:
+        sst = (parsed.get("extra") or {}).get("server_stream_time", -1)
+        aw = len(parsed.get("aweme_list") or [])
+        if aw > 0:
+            print(f"[verdict] ACCEPTED  aweme_count={aw}  sst={sst}ms", file=sys.stderr)
+            return 0
+        else:
+            print(f"[verdict] SILENT-REJECT  aweme_count=0  sst={sst}ms", file=sys.stderr)
+            return 1
+
+    print("[verdict] NON-JSON RESPONSE", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
