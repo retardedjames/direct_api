@@ -27,7 +27,7 @@ sudo apt-get install -y \
     curl wget git ca-certificates gnupg \
     python3-pip python3-venv \
     android-tools-adb \
-    xvfb x11vnc openbox \
+    xvfb x11vnc openbox weston \
     build-essential pkg-config \
     jq
 
