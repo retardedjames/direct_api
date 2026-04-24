@@ -7,9 +7,11 @@ Protocol (verified from phone captures):
   - Endpoint is always /aweme/v1/search/item/
   - Page 1: cursor=0, sort_type=1, is_filter_search=1, search_source=tab_search,
     search_id="". Response carries x-tt-logid header.
-  - Page 2+: cursor=10, 20, ...; all other params the same, and
-    search_id = <x-tt-logid from the page-1 response>, held constant across
-    every subsequent page.
+  - Page 2+: cursor=PAGE_SIZE, 2*PAGE_SIZE, ...; all other params the
+    same, and search_id = <x-tt-logid from the page-1 response>, held
+    constant across every subsequent page.
+  - `count` is the per-page size. Server ceiling is 30; phone captures
+    used 10. We use 30 for fewer sign calls per keyword.
 
 Stop conditions:
   1. response `has_more` is 0/false, OR
@@ -48,7 +50,7 @@ from replay_search import (
 )
 from frida_signer import FridaSigner
 
-PAGE_SIZE = 10
+PAGE_SIZE = 30
 LIKE_FLOOR = 1000
 MAX_PAGES_DEFAULT = 100
 
