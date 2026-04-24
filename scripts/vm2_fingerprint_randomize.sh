@@ -89,6 +89,11 @@ log "persona: $BRAND $MODEL (serial=$SERIAL)"
 # values set here are baked into the process's property set and can't be
 # overridden by later setprop. Upsert each key instead of appending to avoid
 # duplicates on re-run.
+#
+# We also set ro.adb.secure=0 to disable adb's key-auth handshake. On a
+# headless container we can't click the "Allow this computer" dialog, and
+# the container only listens on a bridge that the host firewalls — so
+# skipping the auth is a reasonable tradeoff.
 [ -f "${BASE_PROP}.vm-bak" ] || cp "$BASE_PROP" "${BASE_PROP}.vm-bak"
 
 set_prop() {
@@ -124,7 +129,8 @@ for kv in \
     "ro.vendor.build.fingerprint=$FINGERPRINT" \
     "ro.odm.build.fingerprint=$FINGERPRINT" \
     "ro.serialno=$SERIAL" \
-    "ro.boot.serialno=$SERIAL"; do
+    "ro.boot.serialno=$SERIAL" \
+    "ro.adb.secure=0"; do
     key=${kv%%=*}; val=${kv#*=}
     set_prop "$key" "$val" "$BASE_PROP"
 done

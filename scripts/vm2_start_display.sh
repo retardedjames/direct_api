@@ -44,6 +44,8 @@ for p in x11vnc weston Xvfb; do
         pkill -u "$(id -u)" -x "$p" || true
     fi
 done
+# socat forwarder from a previous run
+pkill -u "$(id -u)" -f "TCP-LISTEN:5556" 2>/dev/null || true
 sleep 1
 
 # Stop any prior waydroid session — a stale session blocks show-full-ui.
@@ -107,13 +109,13 @@ nohup waydroid session start > "$LOGDIR/waydroid_session.log" 2>&1 &
 sleep 5
 nohup waydroid show-full-ui > "$LOGDIR/waydroid_ui.log" 2>&1 &
 
-# Wait for the Android container to be boot_completed.
+# Wait for Android's sys.boot_completed — read via lxc-attach so we don't
+# depend on port forwarding yet.
 log "waiting for Android to finish booting"
-adb kill-server >/dev/null 2>&1 || true
 BOOTED=0
 for i in $(seq 1 60); do
-    adb connect 127.0.0.1:5556 >/dev/null 2>&1 || true
-    if adb -s 127.0.0.1:5556 shell getprop sys.boot_completed 2>/dev/null | grep -q '^1'; then
+    if sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
+           getprop sys.boot_completed 2>/dev/null | grep -q '^1'; then
         BOOTED=1
         break
     fi
@@ -121,6 +123,28 @@ for i in $(seq 1 60); do
 done
 if [ "$BOOTED" -ne 1 ]; then
     echo "ERROR: boot_completed=1 never observed. Logs in $LOGDIR/." >&2
+    exit 1
+fi
+
+# ---------- 6. socat port forward for adb ----------
+# Waydroid's adbd listens on the container's bridge IP, not 127.0.0.1:5556 the
+# existing scraper code (and VM-1's FridaSigner) expects. Forward them.
+CONTAINER_IP=$(sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
+    ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+if [ -z "$CONTAINER_IP" ]; then
+    echo "ERROR: could not read container IP" >&2
+    exit 1
+fi
+log "adb port forward: 127.0.0.1:5556 -> $CONTAINER_IP:5555"
+# Subshell-detach so ssh doesn't hang holding onto socat's fds.
+( socat TCP-LISTEN:5556,bind=127.0.0.1,reuseaddr,fork TCP:${CONTAINER_IP}:5555 \
+    >> "$LOGDIR/socat_adb.log" 2>&1 & )
+
+sleep 1
+adb kill-server >/dev/null 2>&1 || true
+adb connect 127.0.0.1:5556 2>&1 | tail -2
+if ! adb -s 127.0.0.1:5556 shell getprop sys.boot_completed 2>/dev/null | grep -q '^1'; then
+    echo "ERROR: adb connected but getprop failed. Auth issue? Check ro.adb.secure" >&2
     exit 1
 fi
 
