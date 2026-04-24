@@ -65,16 +65,22 @@ fi
 # ---------- 2. persona ----------
 # Samsung Galaxy A54 5G (SM-A546U1) — differs from VM-1's stock WayDroid
 # persona. At N=3+ make this a random pick from a small pool.
+#
+# NOTE: We intentionally DO NOT override ro.hardware or ro.board.platform.
+# Android's HAL loader uses those to locate vendor libraries (memtrack.<hw>.so,
+# gatekeeper.<hw>.so etc.); setting them to a real-device value makes the
+# loader look for files that Waydroid's generic vendor image doesn't ship,
+# and services crash in a boot loop. We keep those at Waydroid's defaults
+# and only override the app-visible identity props — what TikTok actually
+# reads via Build.MODEL, Build.MANUFACTURER, Build.FINGERPRINT, Build.SERIAL.
 BRAND=samsung
 MANUFACTURER=samsung
 MODEL=SM-A546U1
 DEVICE=a54x
 PRODUCT=a54xsq
-PLATFORM=exynos850
-BOOTLOADER=A546U1UEU8CXJ1
 # Serial: 16 hex chars uppercase
 SERIAL=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n' | tr '[:lower:]' '[:upper:]')
-FINGERPRINT="samsung/a54xsq/a54x:13/TP1A.220624.014/${BOOTLOADER}:user/release-keys"
+FINGERPRINT="samsung/a54xsq/a54x:13/TP1A.220624.014/A546U1UEU8CXJ1:user/release-keys"
 
 log "persona: $BRAND $MODEL (serial=$SERIAL)"
 
@@ -118,10 +124,7 @@ for kv in \
     "ro.vendor.build.fingerprint=$FINGERPRINT" \
     "ro.odm.build.fingerprint=$FINGERPRINT" \
     "ro.serialno=$SERIAL" \
-    "ro.boot.serialno=$SERIAL" \
-    "ro.board.platform=$PLATFORM" \
-    "ro.hardware=$PLATFORM" \
-    "ro.bootloader=$BOOTLOADER"; do
+    "ro.boot.serialno=$SERIAL"; do
     key=${kv%%=*}; val=${kv#*=}
     set_prop "$key" "$val" "$BASE_PROP"
 done
@@ -161,8 +164,6 @@ manufacturer=$MANUFACTURER
 model=$MODEL
 device=$DEVICE
 product=$PRODUCT
-platform=$PLATFORM
-bootloader=$BOOTLOADER
 serialno=$SERIAL
 fingerprint=$FINGERPRINT
 EOF
