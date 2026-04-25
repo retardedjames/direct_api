@@ -136,6 +136,16 @@ ssh -L 5901:localhost:5901 -i ~/.ssh/jamescvermont jamescvermont@$VMN_IP
 # Screen Sharing), connect to localhost:5901 — no password.
 ```
 
+Before touching anything in VNC, kill SystemUI once so it restarts with
+a clean InputDispatcher. Without this, every tap triggers a recurring
+"System UI isn't responding" ANR dialog (discovered on vm4, 2026-04-25):
+
+```bash
+ssh -i ~/.ssh/jamescvermont jamescvermont@$VMN_IP \
+    'adb -s 127.0.0.1:5556 shell killall com.android.systemui'
+# Wait ~3s — Android restarts SystemUI automatically. Then open VNC.
+```
+
 ### Phase 4 — create + warm account in VNC ⬅ **YOUR PART**
 
 In the VNC view:
@@ -271,6 +281,24 @@ If `[vmN]` runs clean overnight: it's done. Next clone uses this exact
 runbook.
 
 ## Critical gotchas (learned the hard way)
+
+### SystemUI ANR during VNC signup
+
+Symptom: every tap in TT Lite triggers "System UI isn't responding".
+Hitting "Wait" makes it come back within seconds. Root cause: weston
+feeds pointer coordinates outside the framebuffer that starve
+SystemUI's InputDispatcher thread. A full container restart does NOT
+fix it — the wedged state survives.
+
+Fix (run before touching VNC):
+```bash
+adb -s 127.0.0.1:5556 shell killall com.android.systemui
+```
+Android restarts SystemUI in ~2s with a fresh InputDispatcher. ANRs
+stop. This is now a standard Phase 3 step above.
+
+Note: `su 0 killall` errors ("su: inaccessible") on this image — plain
+`killall` works because the adb shell user can signal SystemUI's process.
 
 ### `ADB_DEVICE` env var is required
 
