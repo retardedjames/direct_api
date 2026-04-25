@@ -41,7 +41,7 @@ import urllib.request
 from pathlib import Path
 
 _ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "")
-if _ACCOUNT in ("vm3", "vm4"):
+if _ACCOUNT in ("vm3", "vm4", "vm5"):
     _mod = __import__(f"replay_search_{_ACCOUNT}")
     DEVICE      = _mod.DEVICE
     USER_AGENT  = _mod.USER_AGENT
