@@ -55,8 +55,8 @@ NTFY_PREFIX = os.environ.get("NTFY_PREFIX", "")  # e.g. "[vm3]" to distinguish w
 MAX_PAGES_DEFAULT = 50
 LIKE_FLOOR_DEFAULT = 1000
 
-INTER_TERM_SLEEP_MIN = 30   # seconds
-INTER_TERM_SLEEP_MAX = 90
+INTER_TERM_SLEEP_MIN = 15   # seconds
+INTER_TERM_SLEEP_MAX = 45
 INTER_PAGE_SLEEP_MIN = 0.5
 INTER_PAGE_SLEEP_MAX = 2.0
 REJECT_BACKOFF_SECONDS = 600  # 10 minutes after a suspected silent-reject
