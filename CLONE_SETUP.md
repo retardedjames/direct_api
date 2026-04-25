@@ -70,7 +70,11 @@ ssh -i ~/.ssh/jamescvermont -o StrictHostKeyChecking=no jamescvermont@$VMN_IP 'u
 ### Phase 2 — wipe TT Lite state + randomize fingerprint
 
 Paste this whole block into one SSH session — it's idempotent and
-order-sensitive (container must be stopped during fingerprint randomize).
+order-sensitive. Step 2.5 is **critical** and was missing from earlier
+clones (vm3, vm4): it resets Android's per-package SSAID database, which
+is the input to ByteDance's `openudid`. Without it, every clone of the
+GCP image inherits the same TT Lite SSAID and therefore the same
+openudid — a fleet-wide tell.
 
 ```bash
 ssh -i ~/.ssh/jamescvermont jamescvermont@$VMN_IP <<'REMOTE'
@@ -84,16 +88,31 @@ sleep 2
 #    waydroid_base.prop). Stops + restarts container.
 sudo bash ~/direct_api/scripts/vm2_fingerprint_randomize.sh
 
+# 2.5. CRITICAL: Reset the per-package SSAID database
+#      (/data/system/users/0/settings_ssaid.xml) so TT Lite gets a fresh
+#      Settings.Secure.ANDROID_ID value when it first asks. Without this,
+#      every clone of the GCP image inherits the same TT Lite SSAID
+#      (a6eba2dceadf37e7 on the original vm1 image) and therefore the
+#      same `openudid`. Also wipes /data/data/com.tiktok.lite.go on the
+#      host side as belt-and-suspenders. Stops the container; the next
+#      step restarts it.
+sudo bash ~/direct_api/scripts/vm2_reset_ssaid.sh
+
 # 3. Bring up the display stack (Xvfb + weston + waydroid session +
 #    x11vnc on 127.0.0.1:5901 + socat 127.0.0.1:5556 -> container).
+#    settings_ssaid.xml is regenerated with a fresh userkey when Android
+#    boots here.
 bash ~/direct_api/scripts/vm2_start_display.sh
 
-# 4. Apply runtime identity (android_id, bluetooth_address, device_name).
+# 4. Apply runtime identity (android_id global, bluetooth_address,
+#    device_name). Note: `settings put secure android_id` writes to the
+#    GLOBAL secure settings table, NOT the per-package SSAID table —
+#    apps actually read the SSAID, so step 2.5 is the load-bearing one.
 bash ~/direct_api/scripts/vm2_apply_runtime_identity.sh
 
 # 5. Wipe TT Lite app data so it re-registers fresh on next launch.
-#    Cloned image already has TT Lite installed; we keep the install
-#    but blow away the per-account state ByteDance caches.
+#    Step 2.5 already wiped this on the host side, but pm clear is the
+#    correct in-container path and is idempotent.
 adb -s 127.0.0.1:5556 shell pm clear com.tiktok.lite.go
 
 # 6. Push frida-server 16.6.6 + start it inside the LXC.
@@ -112,19 +131,54 @@ nohup x11vnc -display :1 -forever -nopw -localhost -shared -rfbport 5901 \
     > ~/logs/x11vnc.log 2>&1 &
 disown
 
+# 9. Wait for ByteDance registration to settle, then print fingerprint
+#    + the values TT Lite registered with. Sanity-check these against
+#    the most recent clone (replay_search_vm{N-1}.py) — `openudid`,
+#    `device_id`, and `install_id` MUST differ. If `openudid` matches
+#    the previous clone, step 2.5 didn't run / failed.
+sleep 30
+
 echo "=== fingerprint summary ==="
 echo "model:    $(adb -s 127.0.0.1:5556 shell getprop ro.product.model)"
 echo "serial:   $(adb -s 127.0.0.1:5556 shell getprop ro.serialno)"
-echo "android_id: $(adb -s 127.0.0.1:5556 shell settings get secure android_id)"
+echo "android_id (global): $(adb -s 127.0.0.1:5556 shell settings get secure android_id)"
 echo "MAC:      $(adb -s 127.0.0.1:5556 shell ip link show eth0 | grep -oE 'ether [0-9a-f:]+' | awk '{print $2}')"
 echo "tt_pid:   $(adb -s 127.0.0.1:5556 shell pidof com.tiktok.lite.go)"
+echo "--- ByteDance-issued IDs (must differ from previous clones) ---"
+echo "openudid: $(sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
+    grep -oE 'openudid&quot;:&quot;[^&]*' \
+    /data/data/com.tiktok.lite.go/shared_prefs/push_multi_process_config.xml \
+    2>/dev/null | head -1 | sed 's/.*&quot;//')"
+echo "device_id: $(sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
+    grep -oE '<string name=\"device_id\">[^<]*' \
+    /data/data/com.tiktok.lite.go/shared_prefs/applog_stats.xml \
+    2>/dev/null | sed 's/.*>//')"
+echo "install_id: $(sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
+    grep -oE '<string name=\"install_id\">[^<]*' \
+    /data/data/com.tiktok.lite.go/shared_prefs/applog_stats.xml \
+    2>/dev/null | sed 's/.*>//')"
 
 REMOTE
 ```
 
-That should print 5 unique-per-clone identifiers and a non-empty TT Lite
-PID. Sanity check: model = `SM-A546U1` (the script's hardcoded persona),
-serial + MAC + android_id all freshly random.
+That should print 5 unique-per-clone identifiers plus the three
+ByteDance-issued IDs. **Critical sanity check before proceeding to
+Phase 4:** `openudid` must differ from every previous clone's
+`replay_search_vm{N-1}.py:DEVICE["openudid"]`. If openudid matches
+(e.g. `a6eba2dceadf37e7` is the leaked-from-vm1 value), step 2.5 didn't
+take effect — go back, run `vm2_reset_ssaid.sh` manually, force-stop +
+`pm clear` TT Lite, relaunch.
+
+**Known partial leak (2026-04-25):** even with step 2.5 fixing openudid,
+ByteDance has been observed to return the same `device_id` and
+`install_id` across clones (vm3/vm4/vm5 all got
+`device_id=7632239515504494094`, `install_id=7632240515673704205`
+despite all other inputs differing). The shared `device_id` is a
+fleet-wide tell, but the active scrapers have been running on it
+without immediate flag — per-account rate limit hits first. Track this
+in `memory/project_fingerprint_leaks.md`; if a clone gets flagged
+within hours of bring-up, this is the most likely culprit and the GCP
+image needs a deeper rebuild from a TT-Lite-uninstalled state.
 
 ### Phase 3 — open VNC
 
@@ -141,8 +195,12 @@ a clean InputDispatcher. Without this, every tap triggers a recurring
 "System UI isn't responding" ANR dialog (discovered on vm4, 2026-04-25):
 
 ```bash
+# Get the SystemUI PID, then kill it via lxc-attach (root on host).
+# `killall com.android.systemui` and `am force-stop` do NOT work on this image.
+SYSPID=$(ssh -i ~/.ssh/jamescvermont jamescvermont@$VMN_IP \
+    'adb -s 127.0.0.1:5556 shell pidof com.android.systemui')
 ssh -i ~/.ssh/jamescvermont jamescvermont@$VMN_IP \
-    'adb -s 127.0.0.1:5556 shell killall com.android.systemui'
+    "sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- kill -9 $SYSPID"
 # Wait ~3s — Android restarts SystemUI automatically. Then open VNC.
 ```
 
@@ -282,6 +340,38 @@ runbook.
 
 ## Critical gotchas (learned the hard way)
 
+### Per-package SSAID survives `pm clear` AND every clone of a GCP image
+
+Symptom: vm3, vm4, vm5 all reported the same `openudid =
+a6eba2dceadf37e7` to ByteDance, despite different MACs, serials,
+`settings put secure android_id` values, and `clientudid`s. ByteDance
+deduped device_id+install_id across all three. Discovered while
+bringing up vm5 on 2026-04-25.
+
+Root cause: on Android 8+, `Settings.Secure.ANDROID_ID` is **per
+package**, stored in `/data/system/users/0/settings_ssaid.xml`. Each
+app's SSAID = `HMAC(userkey, package_signing_cert)`. The userkey is a
+random 256-bit value generated **once at first Android boot** and
+written to that file; the file lives on the system partition and is
+NOT touched by `pm clear` or `pm uninstall`. Cloning a GCP image
+carries the userkey AND every per-app SSAID forward unchanged. ByteDance
+reads `Settings.Secure.getString("android_id")`, hashes it as its
+`openudid`, and the registration server collapses identical openudids
+to the same device_id.
+
+Fix: `scripts/vm2_reset_ssaid.sh` deletes settings_ssaid.xml +
+.fallback while the container is stopped. Android regenerates them on
+next boot with a fresh userkey, which produces fresh per-app SSAIDs
+for every package — including TT Lite. Step 2.5 in Phase 2 above.
+
+`vm2_apply_runtime_identity.sh`'s `settings put secure android_id …`
+writes to the GLOBAL secure settings table, NOT the per-app SSAID
+table. Apps don't read the global value. That script does still set
+`bluetooth_address` and `device_name` correctly, but its android_id
+write is essentially a no-op for fingerprinting purposes. Don't trust
+the post-randomize summary's `android_id = …` line as evidence of
+isolation — verify `openudid` in the post-Phase-2 summary instead.
+
 ### SystemUI ANR during VNC signup
 
 Symptom: every tap in TT Lite triggers "System UI isn't responding".
@@ -392,8 +482,9 @@ ssh $VMN_IP 'bash ~/direct_api/scripts/cloneN_start.sh vmN'
 | Path | Role |
 |---|---|
 | `scripts/vm2_fingerprint_randomize.sh` | Phase 2 step 2 — LXC MAC + persona + `ro.serialno` + waydroid_base.prop. Despite vm2 in name, used for all clones. |
+| `scripts/vm2_reset_ssaid.sh` | Phase 2 step 2.5 — deletes `/data/system/users/0/settings_ssaid.xml` so Android regenerates it with a fresh `userkey` (HMAC source for every per-app `Settings.Secure.ANDROID_ID`). Without this, every clone of the GCP image inherits the same TT Lite SSAID → same openudid sent to ByteDance. Container must be stopped (script handles it). |
 | `scripts/vm2_start_display.sh` | Phase 2 step 3 — Xvfb + weston + waydroid session + x11vnc + socat 5556 forward. |
-| `scripts/vm2_apply_runtime_identity.sh` | Phase 2 step 4 — android_id + bluetooth_address + device_name via adb. |
+| `scripts/vm2_apply_runtime_identity.sh` | Phase 2 step 4 — android_id (global table) + bluetooth_address + device_name via adb. NB the global android_id is NOT what apps read — they read the per-package SSAID set by step 2.5. This script kept for completeness; remove if it becomes confusing. |
 | `scripts/vm2_install_tt.sh` | Phase 2 step 6 — frida-server push (skips TT Lite install if already present). |
 | `replay_search.py` | VM-1's identity. Template for `replay_search_vmN.py`. |
 | `replay_search_vm{N}.py` | Per-VM identity. Gitignored. |
