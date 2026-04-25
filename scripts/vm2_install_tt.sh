@@ -4,7 +4,7 @@
 # Prerequisites:
 #   1. Base install done (scripts/vm2_base_install.sh)
 #   2. Fingerprint randomized BEFORE this script (scripts/vm2_fingerprint_randomize.sh)
-#   3. Session up + adb connected (scripts/vm2_start_session.sh)
+#   3. Session up + adb connected (scripts/vm2_start_display.sh)
 #   4. APK splits copied to ~/ttapk/ — from your laptop:
 #        scp -i ~/.ssh/jamescvermont /home/james/direct_api/ttapk/*.apk \
 #            jamescvermont@<VM2_IP>:~/ttapk/
@@ -22,7 +22,7 @@ FRIDA_URL="https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/${F
 
 # ---------- sanity ----------
 if ! adb devices | grep -q '127.0.0.1:5556.*device'; then
-    echo "ERROR: adb not connected to 127.0.0.1:5556. Run scripts/vm2_start_session.sh first." >&2
+    echo "ERROR: adb not connected to 127.0.0.1:5556. Run scripts/vm2_start_display.sh first." >&2
     exit 1
 fi
 if ! ls "$TTAPK_DIR"/*.apk >/dev/null 2>&1; then

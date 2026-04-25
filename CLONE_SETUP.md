@@ -238,4 +238,5 @@ identify the matching key.
 ## See also
 
 - `HANDOFF.md` — overall architecture, signing contract, day-to-day ops.
-- `HISTORY.md` — failed approaches kept for "why don't we just…?" answers.
+- `HISTORICAL/README.md` — index of archived files (failed approaches,
+  RE artifacts, research data) for "why don't we just…?" answers.

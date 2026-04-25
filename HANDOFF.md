@@ -1,29 +1,30 @@
 # direct_api handoff
 
-Goal: replace the phone+Waydroid+mitmproxy scraper with pure HTTP calls to
-TikTok's mobile search API, signed by a live TT Lite process on an ARM
-Waydroid VM. **Why**: TikTok rate-limits accounts driven at scrape-speed
-through the UI, so the mitmproxy pattern caps at a few keywords/day per
-account. One logged-in device + pure HTTP = thousands of queries/day per
-account, no UI friction.
+Goal: replace the phone+Waydroid+mitmproxy scraper with pure HTTP calls
+to TikTok's mobile search API, signed by a live TT Lite process on an
+ARM Waydroid VM. **Why**: TikTok rate-limits accounts driven at
+scrape-speed through the UI, so the mitmproxy pattern caps at a few
+keywords/day per account. One logged-in device + pure HTTP = thousands
+of queries/day per account, no UI friction.
 
-For failed approaches, Frida gotchas, and other background that's no
-longer needed day-to-day, see `HISTORY.md`.
+For new clone bring-up, see `CLONE_SETUP.md` — that's the live runbook.
+For failed approaches and history, see `HISTORICAL/HISTORY.md`.
 
-## TL;DR — current state (2026-04-24) — ✅ END-TO-END SHIPPED
+## TL;DR — current state
 
-- Frida signer-proxy runs 24/7 on ARM VM `34.133.197.84`.
-  `frida-server 16.6.6`, TT Lite pid attached, persistent agent
-  `frida/sign_agent.js` exposes `rpc.exports.sign`.
-- `scrape_keyword.py` on the ARM VM paginates a keyword, signs each page
-  via `FridaSigner`, calls TikTok's `/aweme/v1/search/item/`, and writes
-  videos ≥ `--floor` likes (default 1000) to the shared Postgres on
-  `150.136.40.239` via `db.save_search`.
-- First real run: `"brattleboro vermont"` → 40 videos in 4.6s → 24 saved.
-  Smoke test: `mario` → 30 videos, ~700ms server_stream_time.
-- Sign latency ~1.3s on first call (attach + warm), ~40–80ms thereafter
-  for the life of the process. Keep one long-lived `FridaSigner` —
-  don't re-attach per page.
+- A scraper VM is an ARM64 GCP instance running Waydroid + TT Lite +
+  frida-server 16.6.6. The persistent Frida agent
+  (`frida/sign_agent.js`) attaches to the live TT Lite pid and exposes
+  `rpc.exports.sign(url, headers)`.
+- `scrape_keyword.py` paginates a keyword, calls FridaSigner per page,
+  hits TikTok's `/aweme/v1/search/item/`, writes videos with ≥1000 likes
+  (configurable) into shared Postgres on `150.136.40.239`.
+- `continual_scraper.py` is the production daemon — pulls pending
+  keywords from `terms` queue, runs `scrape_keyword`, sleeps 60-180s,
+  emits `[vmN]`-prefixed ntfy notifications per term.
+- New scraper VMs are spun up by cloning a GCP machine image and
+  running `scripts/clone_bootstrap.sh` + `scripts/clone_finalize.sh`.
+  Each VM runs its own account.
 
 ## Architecture
 
@@ -34,18 +35,20 @@ longer needed day-to-day, see `HISTORY.md`.
     GitHub (retardedjames/direct_api)
         │  git pull
         ▼
-    ARM64 Waydroid VM 34.133.197.84  ──► Postgres 150.136.40.239
-      ├─ Waydroid 1.6.2 + LineageOS 20 GAPPS (Android 13)       (db=tiktoks, app1_user)
+    ARM64 Waydroid VM (any clone) ──► Postgres 150.136.40.239
+      ├─ Waydroid 1.6.2 + LineageOS 20 GAPPS (Android 13)
       ├─ TT Lite 24/7 (com.tiktok.lite.go)
       ├─ frida-server 16.6.6 on 127.0.0.1:27042
       ├─ ~/direct_api (git clone; PAT embedded in remote URL)
-      └─ scrape_keyword.py + frida_signer.py + sign_agent.js
+      └─ continual_scraper.py + scrape_keyword.py + frida_signer.py + sign_agent.js
 ```
 
-- VM deps: `psycopg2-binary`, `sqlalchemy` installed with
-  `pip3 install --user --break-system-packages` (PEP 668).
-- VM git remote URL has the gh-auth PAT baked in
-  (`https://retardedjames:<token>@github.com/...`), so `git pull` JFW.
+Each VM holds its own per-account identity in `replay_search_vmN.py`
+(gitignored). `scrape_keyword.py` and `replay_search_frida.py` import
+that module via the `TIKTOK_ACCOUNT=vmN` env var.
+
+VM Python deps: `psycopg2-binary`, `sqlalchemy` installed with
+`pip3 install --user --break-system-packages` (PEP 668).
 
 ## The signing contract
 
@@ -62,209 +65,140 @@ class ms.bd.o.k {
 - `op` integer dispatches to internal services. Known ops:
   - `0x01000001` — string de-obfuscation (thousands of calls/sec; noise).
   - `0x03000001` — **request signing**. `arg` = full URL w/ query,
-    `payload` = flat `String[]{k,v,k,v,...}` of existing request headers.
-    Returns flat `String[]{"X-Argus",...,"X-Ladon",...}`. Some endpoints
-    only get a 2-header subset (Gorgon+Khronos for monitor/log
+    `payload` = flat `String[]{k,v,k,v,...}` of existing request
+    headers. Returns flat `String[]{"X-Argus",...,"X-Ladon",...}`. Some
+    endpoints get a 2-header subset (Gorgon+Khronos for monitor/log
     collectors); `/aweme/v1/search/item/` gets all 4.
-- `ts` is process-monotonic (same across sign calls in one process).
-  `0` works; the URL's own `_rticket` / `ts` params carry wall-clock.
+- `ts` is process-monotonic. `0` works; the URL's own `_rticket`/`ts`
+  params carry wall-clock.
 
-## Key files
+Sign latency ~1.3s on first attach + warm, ~40-80ms thereafter. Keep
+one long-lived `FridaSigner` — don't re-attach per page.
+
+## Production files
 
 | File | Purpose |
 |---|---|
-| `scrape_keyword.py` | Production entry point. Paginates cursor=0→10→… for a keyword, writes videos via `db.save_search`. Runs on the ARM VM. |
-| `replay_search_frida.py` | Single-page smoke test — sign + call + print verdict. |
-| `replay_search.py` | Authoritative `DEVICE` / `COOKIE` / `X_TT_TOKEN` / `USER_AGENT` + the RapidAPI single-page reference path. **Do not regenerate** — `sid_guard` valid until 2026-10-18. |
-| `frida_signer.py` | Python client. One singleton per process, keeps one attached session. |
-| `frida/sign_agent.js` | Persistent Frida agent loaded into TT Lite; exposes `rpc.exports.sign(url, headers)`. |
-| `frida/hook_metasec.js` | Discovery script — used once to find the JNI entrypoint. Kept for re-derivation if libmetasec_ov changes. |
-| `frida/trace_sign.js` | Tracer — logs every call to `ms.bd.o.k.a` (filters op `0x01000001`). Kept for future debugging. |
-| `db.py` | SQLAlchemy models + `save_search`. Also lives in the parent tiktok-scraper schema. |
-| `libs/libmetasec_ov.so` | Extracted ByteDance security SDK, ARM64. **Gitignored.** |
-
-## Infrastructure inventory
-
-| Role | Host | SSH | Notes |
-|---|---|---|---|
-| **ARM64 Waydroid — Frida signer + scraper** | `34.133.197.84` | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.133.197.84` | GCP t2a, Ubuntu 26.04. Waydroid 1.6.2 + LineageOS 20 GAPPS arm64. TT Lite installed. `frida-server 16.6.6`. `scrape_keyword.py` runs here. |
-| x86 Waydroid sandbox | `34.171.201.223` | same key | **Static RE only.** Frida can't `Interceptor.attach` to Houdini-translated ARM64 code — confirmed dead end. Use for reading memory / extracting `libmetasec_ov.so`. See `HISTORY.md`. |
-| Oracle ARM VPS — Postgres | `150.136.40.239` | `ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239` | Prod DB `tiktoks`, `app1_user` / `app1dev`. Shared with the old mobile scraper. |
-| APK patching | `34.162.181.247` | see memory | x86 GCP VM with `apktool` + keystore for re-signing TTLite if needed. |
+| `scrape_keyword.py` | Production entry. Paginates one keyword, signs per page, writes videos to Postgres. |
+| `continual_scraper.py` | Pulls pending terms from queue, runs scrape_keyword, sleeps, retries. |
+| `replay_search_frida.py` | Single-page smoke test. |
+| `replay_search_vmN.py` | Per-VM identity (cookies, install_id, openudid, X-Tt-Token, DEVICE dict). Gitignored. Generated by `scripts/capture_session.py`. |
+| `frida_signer.py` | Python client for the in-container Frida agent. Reads `ADB_DEVICE` + `FRIDA_HOST` env vars. |
+| `frida/sign_agent.js` | Frida agent that exposes `rpc.exports.sign` from MSSDK. Same on all VMs. |
+| `db.py` | SQLAlchemy models + `save_search`. |
+| `libs/libmetasec_ov.so` | Extracted ByteDance security SDK (gitignored). |
+| `scripts/clone_bootstrap.sh` | One-shot clone bring-up: randomize fingerprint, reset SSAID, start session, push frida, launch TT Lite. |
+| `scripts/clone_finalize.sh` | Post-VNC-signup: capture session, smoke-test, start scraper. |
+| `scripts/capture_session.py` | Parses TT Lite shared_prefs into `replay_search_vmN.py`. |
+| `scripts/vm2_*.sh` | Lower-level steps invoked by `clone_bootstrap.sh`. The `vm2_` prefix is historical (used for all clones). |
 
 ## Database
 
-Shared Postgres on `150.136.40.239`. Current shape:
+Shared Postgres on `150.136.40.239`. Schema:
 
 - `searches` — one row per keyword-scrape (id, keyword, sort_type, searched_at).
 - `videos` — aweme_id PK, author_uid FK, stats, author/author-relationship.
 - `authors` — uid PK, sec_uid, unique_id, metadata.
 - `search_results` — (search_id, video_id, position) link table.
-- `terms` — **work queue**. id, term, type, `status`
-  (`pending` / `in_progress` / `done` / `failed`), added_at, started_at,
-  completed_at, videos_saved, **`done_old_way` BOOLEAN**.
+- `terms` — work queue. id, term, type, `status`
+  (`pending`/`in_progress`/`done`/`failed`), added_at, started_at,
+  completed_at, videos_saved, `done_old_way` BOOLEAN. `done_old_way=TRUE`
+  for rows backfilled from the legacy mobile_scrape pipeline.
 
-`terms.done_old_way` was added 2026-04-24. All 1,066 then-'done' rows
-were backfilled to `done_old_way=TRUE` so we can tell them apart from
-new Frida-path completions (which default to `FALSE`). 35 `failed` rows
-and 7 `in_progress` rows stayed `FALSE` — no old-path data to preserve.
+## Bringing a clone up from cold (after reboot)
 
-## Operational — bring the stack up from cold
-
-### Step 0 — Check the VM is alive
+If a VM was rebooted and lost its waydroid session / scraper:
 
 ```bash
-ssh -i ~/.ssh/jamescvermont jamescvermont@34.133.197.84
-sudo waydroid status   # Session=RUNNING, Container=RUNNING
-adb -s 127.0.0.1:5556 shell getprop sys.boot_completed   # "1"
+ssh -i ~/.ssh/jamescvermont jamescvermont@<VM_IP>
+cd ~/direct_api
+
+# 1. Display stack + waydroid session.
+bash scripts/vm2_start_display.sh
+
+# 2. Re-push frida-server.
+bash scripts/vm2_install_tt.sh
+
+# 3. Launch TT Lite.
+adb -s 127.0.0.1:5556 shell am start \
+    -n com.tiktok.lite.go/com.ss.android.ugc.aweme.main.homepage.MainActivity
+
+# 4. Smoke test.
+TIKTOK_ACCOUNT=vmN ADB_DEVICE=127.0.0.1:5556 \
+    python3 replay_search_frida.py mario
+# Expect: [verdict] ACCEPTED  aweme_count=30  sst=>200ms
+
+# 5. Resume continual_scraper (replace vmN).
+mkdir -p logs
+nohup env TIKTOK_ACCOUNT=vmN ADB_DEVICE=127.0.0.1:5556 \
+    NTFY_PREFIX="[vmN]" \
+    python3 -u continual_scraper.py > logs/continual_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+disown
 ```
 
-If the container is frozen / `sys.boot_completed` never reaches 1:
-
-```bash
-bash /tmp/wstart.sh
-sudo -u jamescvermont env XDG_RUNTIME_DIR=/run/user/1001 \
-    WAYLAND_DISPLAY=wayland-1 waydroid show-full-ui > /tmp/ui.log 2>&1 &
-adb kill-server && adb connect 127.0.0.1:5556
-```
-
-`waydroid show-full-ui` **must** run after session start or Android
-won't finish boot.
-
-### Step 1 — Confirm frida-server 16.6.6 is running
-
-```bash
-adb -s 127.0.0.1:5556 shell "pidof frida-server"
-```
-
-If missing, relaunch:
+If frida-server is missing inside the container (uncommon):
 
 ```bash
 nohup sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- \
     /data/local/tmp/frida-server -l 0.0.0.0:27042 > /tmp/frida-server.log 2>&1 &
-~/.local/bin/frida --version    # 16.6.6
 ```
 
-**Do not** upgrade to 17.x — crashes on startup on this Android 13 build.
-See `HISTORY.md`.
-
-### Step 2 — Confirm TT Lite is running
-
-```bash
-adb -s 127.0.0.1:5556 shell pidof com.tiktok.lite.go
-# If missing:
-adb -s 127.0.0.1:5556 shell am start -n \
-    com.tiktok.lite.go/com.ss.android.ugc.aweme.main.homepage.MainActivity
-```
-
-The scraper signs URLs, not identities. The cookies/tokens we attach in
-`call_tiktok` (from `replay_search.py:DEVICE/COOKIE/X_TT_TOKEN`) are
-what TikTok uses for auth — the ARM VM's TT being logged into a
-different account is fine.
-
-### Step 3 — Smoke test
-
-```bash
-cd ~/direct_api
-python3 replay_search_frida.py mario
-# Expect: [verdict] ACCEPTED  aweme_count=30  sst=~700ms
-```
-
-### Step 4 — Run a keyword scrape
-
-```bash
-cd ~/direct_api
-git pull
-python3 scrape_keyword.py "brattleboro vermont"
-python3 scrape_keyword.py mario --floor 5000 --max-pages 30
-python3 scrape_keyword.py mario --no-db            # skip Postgres write
-```
-
-Output: one JSONL line per unique video to stdout (or `--out file`),
-with per-page progress + DB summary on stderr.
+Do NOT upgrade frida to 17.x — crashes on Android 13 in Waydroid. See
+`HISTORICAL/HISTORY.md`.
 
 ## Next steps — still open
 
-### Remote signer pattern (optional)
+### Remote signer pattern
 
-Today the scraper has to run on the signer host. For multi-VM scraping,
-forward the frida-server TCP socket to the scraper host:
+Today the scraper runs on the signer host. For multi-host scraping,
+forward the frida-server socket:
 
 ```bash
 # on scraper host:
-ssh -L 27042:127.0.0.1:27042 jamescvermont@34.133.197.84
-# then in Python:
+ssh -L 27042:127.0.0.1:27042 jamescvermont@<signer-vm-ip>
+# then:
 frida.get_device_manager().add_remote_device("127.0.0.1:27042")
 ```
 
 Frida also needs adb to resolve the TT pid. Either mirror adb on the
 scraper host, or refactor `frida_signer.py` to ask the agent for the
-pid via an `enumerate` RPC. Not worth doing until we actually want more
-than one scraper host.
+pid via an `enumerate` RPC. Not worth doing until we actually want
+more than one scraper per signer.
 
-### Persistent signer HTTP server (optional)
+### Persistent signer HTTP server
 
-Each invocation of `frida_signer.py` costs ~1–2s attach + load. For a
-~35K-sign/month workload we can amortize by wrapping `FridaSigner` in a
-FastAPI/Flask server on the ARM VM that keeps one Frida session alive
-and exposes `POST /sign {url, headers}`. Also simplifies the remote
-signer pattern above. Not blocking.
+Wrap `FridaSigner` in a FastAPI server on the VM that keeps one Frida
+session alive and exposes `POST /sign {url, headers}`. Avoids the
+~1-2s attach cost on each scraper restart.
 
 ### Supervise TT Lite
 
-If TT Lite dies (OOM, background killer) the Frida session dies with
-it. Worth adding either a systemd user service that polls
-`adb pidof com.tiktok.lite.go` and re-launches, or a
-`frida.get_device().on('lost', ...)` handler in the HTTP server above
-to reattach. Not urgent — the process has been stable so far.
+If TT Lite dies (OOM / background killer) the Frida session dies with
+it. Add a systemd user service that polls
+`adb pidof com.tiktok.lite.go` and relaunches, or a
+`frida.get_device().on('lost', ...)` handler in the HTTP server above.
 
-### Account / session refresh
+### Investigate the device_id leak
 
-`replay_search.py:COOKIE` holds a `sid_guard` valid until **2026-10-18**.
-After that (or if the device starts getting flagged), recapture fresh
-tokens from a real phone + mitmproxy and update
-`DEVICE`/`COOKIE`/`X_TT_TOKEN`. The `DEVICE` dict is the authoritative
-warm fingerprint — don't regenerate unless forced.
+ByteDance's `/service/2/device_register/` has been observed returning
+the same `device_id`+`install_id` to multiple clones with otherwise
+fully-randomized fingerprints (post-SSAID-fix). Cause unknown — needs
+mitmproxy on the registration call. Documented in
+`memory/project_fingerprint_leaks.md`.
 
-## Appendix A — Known-good device identity
-
-In `replay_search.py:DEVICE`:
-
-- aid: 1340, app_name: musically_go
-- device_id: 7630963143929628173, iid: 7631123284638189325
-- device_type: `moto g power - 2025`, os_version: 16
-- channel: googleplay, sys_region/op_region: US, region: GB
-- Logged-in session token + cookies in `X_TT_TOKEN` and `COOKIE`
-  (sid_guard until 2026-10-18)
-
-Do NOT regenerate — TikTok treats this as a normal, warmed-up,
-logged-in user. Starting over means days of device warming + UI login +
-recapturing tokens.
-
-## Appendix B — Files NOT to commit
+## Files NOT to commit
 
 Already in `.gitignore`:
 
 - `libs/libmetasec_ov.so` — 1.8MB, easy to re-extract from an APK.
-- `oracles/*.json` — contain session cookies + signed headers.
-- `traces/*.log` — include live `odin_tt` / `install_id`.
-- `captured_*.json*` — raw phone captures with cookies.
+- `ttapk/*.apk` — TT Lite split bundle.
+- `replay_search_vm*.py` — per-VM identity files with live cookies.
+- `HISTORICAL/data/` — captured phone flows, oracles, traces (all
+  contain real session cookies / signed headers).
 
-`replay_search.py` contains `COOKIE` + `X_TT_TOKEN` + `RAPIDAPI_KEY`
-and IS in the repo. The GitHub remote is currently public; user has
-opted in to this for now and plans to make it private later.
+## See also
 
-## Appendix C — RapidAPI
-
-Reference path only (not in the hot path anymore):
-
-```
-RAPIDAPI_KEY  = "2861349ef0mshd02e93636381db1p17b22cjsn20fbcdc12948"
-RAPIDAPI_HOST = "bytedance-services.p.rapidapi.com"
-```
-
-BASIC plan = 20 calls/day. Used for one-off oracles (see
-`capture_oracles.py`). Pro tier ($30/mo, 500K calls/month) remains the
-cleanest fallback if the Frida stack ever breaks and can't be restored.
-Run `diff_signers.py oracles/oracle_00_mario_c0.json` to sanity-check a
-new candidate signer against a saved oracle without burning quota.
+- `CLONE_SETUP.md` — the runbook for spinning up a new scraper VM.
+- `HISTORICAL/HISTORY.md` — failed approaches kept for "why don't we
+  just…?" answers.
+- `HISTORICAL/README.md` — index of archived files and what they did.
