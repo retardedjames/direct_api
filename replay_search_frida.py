@@ -17,6 +17,7 @@ import argparse
 import gzip
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -26,7 +27,7 @@ from pathlib import Path
 from replay_search import build_query as _build_query_v1, safe_kw
 
 _ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "")
-if _ACCOUNT in ("vm3", "vm4", "vm5"):
+if re.fullmatch(r"vm\d+", _ACCOUNT):
     _mod = __import__(f"replay_search_{_ACCOUNT}")
     DEVICE         = _mod.DEVICE
     USER_AGENT     = _mod.USER_AGENT
