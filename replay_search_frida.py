@@ -24,13 +24,17 @@ import urllib.request
 from pathlib import Path
 
 from replay_search import build_query as _build_query_v1, safe_kw
-if os.environ.get("TIKTOK_ACCOUNT") == "vm3":
-    from replay_search_vm3 import (
-        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
-        TIKTOK_HOST, TIKTOK_PATH, SEARCH_PARAM_ORDER,
-    )
-    # build_query in replay_search.py uses module-level DEVICE; for VM-3
-    # rebuild it locally so it picks up VM-3's DEVICE.
+
+_ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "")
+if _ACCOUNT in ("vm3", "vm4"):
+    _mod = __import__(f"replay_search_{_ACCOUNT}")
+    DEVICE         = _mod.DEVICE
+    USER_AGENT     = _mod.USER_AGENT
+    COOKIE         = _mod.COOKIE
+    X_TT_TOKEN     = _mod.X_TT_TOKEN
+    TIKTOK_HOST    = _mod.TIKTOK_HOST
+    TIKTOK_PATH    = _mod.TIKTOK_PATH
+    SEARCH_PARAM_ORDER = _mod.SEARCH_PARAM_ORDER
     import time as _time, urllib.parse as _up
     def build_query(keyword: str, cursor: int, count: int = 30) -> str:
         now_ms = int(_time.time() * 1000); now_s = now_ms // 1000

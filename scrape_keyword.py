@@ -40,11 +40,15 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-if os.environ.get("TIKTOK_ACCOUNT") == "vm3":
-    from replay_search_vm3 import (
-        DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
-        TIKTOK_HOST, TIKTOK_PATH,
-    )
+_ACCOUNT = os.environ.get("TIKTOK_ACCOUNT", "")
+if _ACCOUNT in ("vm3", "vm4"):
+    _mod = __import__(f"replay_search_{_ACCOUNT}")
+    DEVICE      = _mod.DEVICE
+    USER_AGENT  = _mod.USER_AGENT
+    COOKIE      = _mod.COOKIE
+    X_TT_TOKEN  = _mod.X_TT_TOKEN
+    TIKTOK_HOST = _mod.TIKTOK_HOST
+    TIKTOK_PATH = _mod.TIKTOK_PATH
 else:
     from replay_search import (
         DEVICE, USER_AGENT, COOKIE, X_TT_TOKEN,
