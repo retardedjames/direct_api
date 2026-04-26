@@ -71,7 +71,7 @@ def write_cookie_file(cookie_str: str, user_agent: str) -> None:
     COOKIE_FILE.write_text(body)
 
 
-def grab_cookies(ready_signal_path: Path) -> tuple[str, str]:
+def grab_cookies(ready_signal_path: Path | None, auto: bool) -> tuple[str, str]:
     PROFILE_DIR.mkdir(exist_ok=True)
     # playwright-stealth patches the standard automation tells (navigator.webdriver,
     # missing chrome.runtime, headless UA hints, WebGL vendor strings, etc.).
@@ -89,6 +89,24 @@ def grab_cookies(ready_signal_path: Path) -> tuple[str, str]:
             ignore_default_args=["--enable-automation"],
         )
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+
+        if auto:
+            # Headless-style flow: navigate to a search page so msToken rotates,
+            # wait a bit for XHRs/scripts to finish, then grab. No human in loop.
+            target = "https://www.tiktok.com/search?q=help"
+            print(f"[refresh] auto mode: navigating to {target}", file=sys.stderr)
+            page.goto(target, wait_until="domcontentloaded")
+            # Let scripts run + msToken rotation happen.
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            time.sleep(3)
+            cookies = ctx.cookies()
+            cookie_str = format_cookie_header(cookies)
+            user_agent = page.evaluate("() => navigator.userAgent")
+            ctx.close()
+            return cookie_str, user_agent
 
         print("[refresh] navigating to tiktok.com...", file=sys.stderr)
         page.goto("https://www.tiktok.com/", wait_until="domcontentloaded")
@@ -201,6 +219,10 @@ def main():
                     default="/tmp/refresh_web_cookie.ready",
                     help="path to touch from another shell to signal 'grab "
                          "cookies now' (default /tmp/refresh_web_cookie.ready)")
+    ap.add_argument("--auto", action="store_true",
+                    help="non-interactive: navigate to /search?q=help, wait for "
+                         "page settle, grab cookies. Use when re-using an existing "
+                         "logged-in profile (no human needed).")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the verification fetch")
     ap.add_argument("--reset-failed", type=str, default="",
@@ -217,7 +239,10 @@ def main():
         print(f"[refresh] --fresh: removing {PROFILE_DIR}", file=sys.stderr)
         shutil.rmtree(PROFILE_DIR)
 
-    cookie_str, user_agent = grab_cookies(Path(args.ready_signal))
+    cookie_str, user_agent = grab_cookies(
+        Path(args.ready_signal) if not args.auto else None,
+        auto=args.auto,
+    )
     if "sessionid=" not in cookie_str or "sid_guard=" not in cookie_str:
         print("[refresh] WARNING: cookie missing sessionid/sid_guard — "
               "you may not be logged in. Writing anyway.", file=sys.stderr)

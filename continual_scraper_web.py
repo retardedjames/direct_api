@@ -13,12 +13,15 @@ Key differences from continual_scraper.py:
 """
 
 import argparse
+import importlib
 import os
 import random
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
 from db import (
     claim_next_term,
@@ -37,6 +40,37 @@ def _load_scraper():
     if skw is None:
         import scrape_keyword_web as _skw
         skw = _skw
+
+
+def _reload_scraper():
+    """Force-reload web_cookie + scrape_keyword_web after an in-process cookie
+    refresh, so the new COOKIE / USER_AGENT take effect without restarting."""
+    global skw
+    import web_cookie
+    importlib.reload(web_cookie)
+    if skw is not None:
+        skw = importlib.reload(skw)
+    else:
+        _load_scraper()
+
+
+def attempt_auto_refresh() -> bool:
+    """Run refresh_web_cookie.py --auto in a subprocess. Returns True on
+    success (verified live), False on any failure. Inherits DISPLAY env so
+    the headed-but-on-VNC Chromium can render."""
+    script = Path(__file__).resolve().parent / "refresh_web_cookie.py"
+    print("[auto-refresh] running refresh_web_cookie.py --auto", file=sys.stderr)
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script), "--auto"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        print("[auto-refresh] TIMEOUT after 120s", file=sys.stderr)
+        return False
+    print(result.stdout, file=sys.stderr)
+    print(result.stderr, file=sys.stderr)
+    return result.returncode == 0
 
 NTFY_TOPIC = "retardedjames-tiktok"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "http://150.136.40.239:2586")
@@ -285,11 +319,31 @@ def main():
             claimed_id = None
 
             if consecutive_errors >= ERROR_HALT_THRESHOLD:
-                msg = (f"Web scraper halting: {consecutive_errors} consecutive "
-                       f"errors. Cookie may be returning empty bodies. "
+                # Try silent self-recovery first: the existing logged-in profile
+                # is usually still good — TikTok just rotated msToken / soft-
+                # revoked the session. A quick navigate-to-search-page in the
+                # same profile typically gives us a fresh cookie.
+                print(f"[auto-refresh] {consecutive_errors} consecutive errors — "
+                      "attempting silent cookie refresh", file=sys.stderr)
+                if attempt_auto_refresh():
+                    print("[auto-refresh] success — reloading modules + resuming",
+                          file=sys.stderr)
+                    _reload_scraper()
+                    consecutive_errors = 0
+                    time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
+                    continue
+
+                # Auto-refresh failed → real login is needed (account expired,
+                # TikTok flagged the profile, etc.). Ntfy + exit; systemd will
+                # restart us, which will keep failing the auto-refresh, but at
+                # rate-limited intervals — until the human VNCs in and runs
+                # `refresh_web_cookie.py --fresh`.
+                msg = (f"Web scraper halting: auto-refresh failed after "
+                       f"{consecutive_errors} consecutive errors. Login needed: "
+                       f"VNC into VPS and run `refresh_web_cookie.py --fresh`. "
                        f"Last: {type(e).__name__}: {e}. Last term: {keyword!r}.")
                 print(f"[halt] {msg}", file=sys.stderr)
-                ntfy(msg, title="TikTok web scraper: halted on repeated errors",
+                ntfy(msg, title="TikTok web scraper: login required",
                      priority="high")
                 sys.exit(1)
 
