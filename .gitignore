@@ -2,11 +2,15 @@
 __pycache__/
 *.pyc
 
-# Browser cookie for the web-search scraper (sid_guard etc.). Never commit.
-web_cookie.py
+# Per-account browser cookies + Chromium profiles for the web-search scraper.
+# Each account has its own dir under accounts/<name>/ — both cookie.py
+# (sid_guard etc.) and playwright_profile/ (logged-in session) must never
+# be committed.
+accounts/
 
-# Persistent Chromium profile used by refresh_web_cookie.py (logged-in
-# tiktok.com session — keep local).
+# Old (pre-multi-account) layout. Kept in .gitignore so a stale local copy
+# doesn't accidentally get committed during the migration.
+web_cookie.py
 .playwright_profile/
 
 # Stray local-only files

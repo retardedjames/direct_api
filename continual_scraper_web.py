@@ -3,10 +3,17 @@
 scrapes www.tiktok.com/api/search/item/full/, upserts to Postgres, pings
 ntfy. Auto-recovers from cookie rot via refresh_web_cookie.py --auto.
 Halts (with ntfy) only when a fresh login is needed.
+
+Per-account: each running instance is bound to one account via --account
+<name>, which resolves accounts/<name>/cookie.py and
+accounts/<name>/playwright_profile/. Multiple accounts can run in parallel
+as separate processes — the queue is parallel-safe (FOR UPDATE SKIP
+LOCKED). Daily search quota (status_code=2484) is per-account, so one
+worker getting throttled does not affect the others.
 """
 
 import argparse
-import importlib
+import datetime as dt
 import os
 import random
 import signal
@@ -25,7 +32,7 @@ from db import (
     save_search,
 )
 
-skw = None  # lazy import so --dry-run / --help work without web_cookie.py
+skw = None  # lazy import so --dry-run / --help work without an account configured
 
 
 def _load_scraper():
@@ -33,18 +40,6 @@ def _load_scraper():
     if skw is None:
         import scrape_keyword_web as _skw
         skw = _skw
-
-
-def _reload_scraper():
-    """Force-reload web_cookie + scrape_keyword_web after an in-process cookie
-    refresh, so the new COOKIE / USER_AGENT take effect without restarting."""
-    global skw
-    import web_cookie
-    importlib.reload(web_cookie)
-    if skw is not None:
-        skw = importlib.reload(skw)
-    else:
-        _load_scraper()
 
 
 # Exit codes from refresh_web_cookie.py — must match the constants there.
@@ -60,15 +55,16 @@ REFRESH_BACKOFF_NORMAL = [(300, "5min"), (900, "15min"), (3600, "60min")]
 REFRESH_BACKOFF_RATE_LIMITED = [(3600, "60min"), (3600, "60min")]
 
 
-def attempt_auto_refresh() -> int:
-    """Run refresh_web_cookie.py --auto in a subprocess. Returns the
-    refresh script's exit code: 0=ok, 1=fail, 2=rate-limited. Inherits
-    DISPLAY env so the headed-but-on-VNC Chromium can render."""
+def attempt_auto_refresh(account: str) -> int:
+    """Run refresh_web_cookie.py --auto --account <name> in a subprocess.
+    Returns the refresh script's exit code: 0=ok, 1=fail, 2=rate-limited.
+    Inherits DISPLAY env so the headed-but-on-VNC Chromium can render."""
     script = Path(__file__).resolve().parent / "refresh_web_cookie.py"
-    print("[auto-refresh] running refresh_web_cookie.py --auto", file=sys.stderr)
+    print(f"[auto-refresh] running refresh_web_cookie.py --auto --account {account}",
+          file=sys.stderr)
     try:
         result = subprocess.run(
-            [sys.executable, str(script), "--auto"],
+            [sys.executable, str(script), "--auto", "--account", account],
             capture_output=True, text=True, timeout=120,
         )
     except subprocess.TimeoutExpired:
@@ -81,7 +77,12 @@ def attempt_auto_refresh() -> int:
 NTFY_TOPIC = "retardedjames-tiktok"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "http://150.136.40.239:2586")
 NTFY_URL = f"{NTFY_SERVER}/{NTFY_TOPIC}"
-NTFY_PREFIX = os.environ.get("NTFY_PREFIX", "[web]")
+
+# TikTok per-account daily search quota. Confirmed 2026-04-26: status_msg =
+# "You have reached the maximum number of searched today." Account-level,
+# resets around 00:00 UTC. A new cookie does NOT help — the throttle is on
+# the account, not the session. Sleep until next UTC midnight + jitter.
+QUOTA_STATUS_CODE = 2484
 
 MAX_PAGES_DEFAULT = 50
 LIKE_FLOOR_DEFAULT = 1000
@@ -118,12 +119,31 @@ class WebKeywordBlocked(Exception):
     loop handles by marking the term done(0) and moving on."""
 
 
-def ntfy(message: str, *, title: str | None = None, priority: str | None = None) -> None:
+class WebQuotaExceeded(Exception):
+    """Raised when page 0 returns status_code=2484 ("max searches today").
+    Per-account daily quota — refreshing the cookie does NOT help. Main
+    loop handles by sleeping until the next UTC midnight + jitter."""
+
+
+def seconds_until_next_utc_midnight(jitter_max: int = 600) -> int:
+    """Seconds from now until the next 00:00 UTC, plus 0..jitter_max
+    random seconds so multiple accounts/workers don't thunder back."""
+    now = dt.datetime.now(dt.timezone.utc)
+    tomorrow = (now + dt.timedelta(days=1)).date()
+    next_midnight = dt.datetime.combine(tomorrow, dt.time.min, tzinfo=dt.timezone.utc)
+    delta = (next_midnight - now).total_seconds()
+    return int(delta) + random.randint(0, jitter_max)
+
+
+def ntfy(message: str, *, title: str | None = None, priority: str | None = None,
+         account: str | None = None) -> None:
+    """Per-account ntfy. Adds [<account>] prefix so multiple workers'
+    notifications are distinguishable on the phone."""
     try:
-        if NTFY_PREFIX:
-            message = f"{NTFY_PREFIX} {message}"
-            if title:
-                title = f"{NTFY_PREFIX} {title}"
+        prefix = f"[{account}]" if account else "[web]"
+        message = f"{prefix} {message}"
+        if title:
+            title = f"{prefix} {title}"
         data = message.encode("utf-8")
         headers = {}
         if title:
@@ -138,7 +158,8 @@ def ntfy(message: str, *, title: str | None = None, priority: str | None = None)
 
 
 def scrape_one(keyword: str, floor: int, max_pages: int,
-               sort_type: int, publish_time: int) -> tuple[int, str, list[dict]]:
+               sort_type: int, publish_time: int,
+               *, account: str) -> tuple[int, str, list[dict]]:
     seen_ids: set[str] = set()
     collected: list[dict] = []
     page = 0
@@ -149,7 +170,8 @@ def scrape_one(keyword: str, floor: int, max_pages: int,
     while page < max_pages:
         print(f"  [page {page}] cursor={cursor}", file=sys.stderr)
         parsed, impr_id, fetch_ms = skw.fetch_page(keyword, cursor, search_id,
-                                                    sort_type, publish_time)
+                                                    sort_type, publish_time,
+                                                    account=account)
         item_list = parsed.get("item_list") or []
         has_more = parsed.get("has_more")
         status_code = parsed.get("status_code")
@@ -162,10 +184,16 @@ def scrape_one(keyword: str, floor: int, max_pages: int,
         #     keep working — this is NOT a session problem. Confirmed empirically
         #     2026-04-25 with water/extended/dry fasting + OMAD: all 403, while
         #     mario/cooking on the same cookie returned status_code=0.
+        #   - 2484: per-account daily search quota. Cookie is fine, account is
+        #     throttled. Refresh won't help — sleep until next UTC midnight.
         #   - anything else: session-level reject (auth wall, captcha, etc.)
         if page == 0 and status_code == 403:
             raise WebKeywordBlocked(
                 f"keyword blocked (status_code=403, status_msg={parsed.get('status_msg')!r})")
+        if page == 0 and status_code == QUOTA_STATUS_CODE:
+            raise WebQuotaExceeded(
+                f"daily quota hit (status_code={status_code}, "
+                f"status_msg={parsed.get('status_msg')!r})")
         if page == 0 and status_code not in (0, None):
             raise WebReject(f"status_code={status_code} status_msg={parsed.get('status_msg')!r}")
 
@@ -211,9 +239,11 @@ def scrape_one(keyword: str, floor: int, max_pages: int,
 
 
 def run_once(term: dict, floor: int, max_pages: int,
-             sort_type: int, publish_time: int) -> tuple[int, str]:
+             sort_type: int, publish_time: int,
+             *, account: str) -> tuple[int, str]:
     keyword = term["term"]
-    total, reason, raws = scrape_one(keyword, floor, max_pages, sort_type, publish_time)
+    total, reason, raws = scrape_one(keyword, floor, max_pages, sort_type,
+                                     publish_time, account=account)
     to_save = [r for r in raws
                if ((r.get("statistics") or {}).get("digg_count") or 0) >= floor]
     dropped = len(raws) - len(to_save)
@@ -227,8 +257,38 @@ def run_once(term: dict, floor: int, max_pages: int,
     return saved, reason
 
 
+def try_auto_refresh_with_backoff(account: str) -> bool:
+    """Try a silent cookie refresh; if it fails, retry with backoff.
+    Returns True if a refresh ultimately succeeded, False if all retries
+    failed (caller should escalate to human-login halt)."""
+    rc = attempt_auto_refresh(account)
+    if rc == REFRESH_EXIT_OK:
+        return True
+
+    if rc == REFRESH_EXIT_RATE_LIMITED:
+        print("[auto-refresh] account rate-limited — waiting it out",
+              file=sys.stderr)
+        schedule = REFRESH_BACKOFF_RATE_LIMITED
+    else:
+        schedule = REFRESH_BACKOFF_NORMAL
+
+    for sleep_s, label in schedule:
+        print(f"[auto-refresh] sleeping {label} before retry...", file=sys.stderr)
+        time.sleep(sleep_s)
+        rc = attempt_auto_refresh(account)
+        if rc == REFRESH_EXIT_OK:
+            print(f"[auto-refresh] success after {label} backoff", file=sys.stderr)
+            return True
+        print(f"[auto-refresh] retry after {label} still failing (rc={rc})",
+              file=sys.stderr)
+    return False
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--account", type=str, required=True,
+                    help="account name (looks up accounts/<name>/cookie.py "
+                         "and accounts/<name>/playwright_profile/)")
     ap.add_argument("--floor", type=int, default=LIKE_FLOOR_DEFAULT)
     ap.add_argument("--max-pages", type=int, default=MAX_PAGES_DEFAULT)
     ap.add_argument("--sort-type", type=int, default=1,
@@ -238,6 +298,7 @@ def main():
     ap.add_argument("--stale-minutes", type=int, default=30)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+    account = args.account
 
     claimed_id: int | None = None
 
@@ -270,7 +331,7 @@ def main():
         if not term:
             msg = "Queue empty — no pending search terms left."
             print(f"[queue] {msg}", file=sys.stderr)
-            ntfy(msg, title="Web scraper: queue drained")
+            ntfy(msg, title="Web scraper: queue drained", account=account)
             break
 
         claimed_id = term["id"]
@@ -286,14 +347,40 @@ def main():
         t0 = time.time()
         try:
             saved, reason = run_once(term, args.floor, args.max_pages,
-                                     args.sort_type, args.publish_time)
+                                     args.sort_type, args.publish_time,
+                                     account=account)
         except WebKeywordBlocked as e:
             print(f"[blocked] {keyword!r}: {e} — marking done(0), continuing",
                   file=sys.stderr)
             mark_term_done(claimed_id, 0)
             claimed_id = None
-            consecutive_rejects = 0  # not a session problem
+            # 403 is a legitimate per-keyword block, not a cookie problem.
+            # Reset both counters so a cluster of moderation-blocked terms
+            # doesn't trip the zero-result halt + auto-refresh.
+            consecutive_rejects = 0
+            consecutive_zero_results = 0
             time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
+            continue
+        except WebQuotaExceeded as e:
+            # Per-account daily search quota. Refresh would be wasted; the
+            # account itself is throttled, not the cookie. Release the term
+            # (so a different worker / a different account could pick it up)
+            # and sleep until the next UTC midnight + jitter.
+            sleep_s = seconds_until_next_utc_midnight()
+            wake_at = (dt.datetime.now(dt.timezone.utc)
+                       + dt.timedelta(seconds=sleep_s))
+            print(f"[quota] {e} — sleeping {sleep_s}s until {wake_at:%Y-%m-%d %H:%M UTC}",
+                  file=sys.stderr)
+            release_term(claimed_id)
+            claimed_id = None
+            ntfy(f"Daily search quota hit; sleeping until {wake_at:%H:%M UTC}. "
+                 f"No action needed.",
+                 title="TikTok web scraper: daily quota",
+                 account=account)
+            consecutive_rejects = 0
+            consecutive_zero_results = 0
+            consecutive_errors = 0
+            time.sleep(sleep_s)
             continue
         except WebReject as e:
             consecutive_rejects += 1
@@ -307,7 +394,7 @@ def main():
                        f"Last term: {keyword!r}.")
                 print(f"[halt] {msg}", file=sys.stderr)
                 ntfy(msg, title="TikTok web scraper: halted on repeated rejects",
-                     priority="high")
+                     priority="high", account=account)
                 sys.exit(1)
 
             print(f"[reject] backing off {REJECT_BACKOFF_SECONDS}s before next term",
@@ -325,68 +412,21 @@ def main():
             claimed_id = None
 
             if consecutive_errors >= ERROR_HALT_THRESHOLD:
-                # Try silent self-recovery first: the existing logged-in profile
-                # is usually still good — TikTok just rotated msToken / soft-
-                # revoked the session. A quick navigate-to-search-page in the
-                # same profile typically gives us a fresh cookie.
-                #
-                # If that fails we don't immediately escalate: the most common
-                # "won't recover" cause is account-level rate-limiting (~1 hour
-                # throttle), which looks identical to a dead cookie at the
-                # response level (HTTP 200 + empty body). So we retry on a
-                # backoff schedule before deciding it's a real login problem.
                 print(f"[auto-refresh] {consecutive_errors} consecutive errors — "
                       "attempting silent cookie refresh", file=sys.stderr)
-                rc = attempt_auto_refresh()
-                if rc == REFRESH_EXIT_OK:
-                    print("[auto-refresh] success — reloading modules + resuming",
-                          file=sys.stderr)
-                    _reload_scraper()
+                if try_auto_refresh_with_backoff(account):
                     consecutive_errors = 0
                     time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
                     continue
 
-                # Pick backoff schedule. Rate-limited → long sleeps only; other
-                # failures → escalating 5/15/60 min retries.
-                if rc == REFRESH_EXIT_RATE_LIMITED:
-                    print("[auto-refresh] account rate-limited — waiting it out",
-                          file=sys.stderr)
-                    schedule = REFRESH_BACKOFF_RATE_LIMITED
-                else:
-                    schedule = REFRESH_BACKOFF_NORMAL
-
-                recovered = False
-                for sleep_s, label in schedule:
-                    print(f"[auto-refresh] sleeping {label} before retry...",
-                          file=sys.stderr)
-                    time.sleep(sleep_s)
-                    rc = attempt_auto_refresh()
-                    if rc == REFRESH_EXIT_OK:
-                        print(f"[auto-refresh] success after {label} backoff — "
-                              "reloading modules + resuming", file=sys.stderr)
-                        _reload_scraper()
-                        consecutive_errors = 0
-                        recovered = True
-                        break
-                    print(f"[auto-refresh] retry after {label} still failing "
-                          f"(rc={rc})", file=sys.stderr)
-
-                if recovered:
-                    time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
-                    continue
-
-                # All backoff retries exhausted → real login needed (account
-                # banned, profile flagged, etc.). Ntfy + exit. Systemd will
-                # restart and the cycle repeats at rate-limited cadence until
-                # the human VNCs in and runs `refresh_web_cookie.py --fresh`.
                 msg = (f"Web scraper halting: auto-refresh failed after backoff "
                        f"retries. Login needed: VNC into VPS and run "
-                       f"`refresh_web_cookie.py --fresh`. "
+                       f"`refresh_web_cookie.py --account {account} --fresh`. "
                        f"Last error: {type(e).__name__}: {e}. "
                        f"Last term: {keyword!r}.")
                 print(f"[halt] {msg}", file=sys.stderr)
                 ntfy(msg, title="TikTok web scraper: login required",
-                     priority="high")
+                     priority="high", account=account)
                 sys.exit(1)
 
             time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
@@ -397,25 +437,37 @@ def main():
         if saved == 0:
             consecutive_zero_results += 1
             if consecutive_zero_results >= ZERO_RESULT_HALT_THRESHOLD:
+                # Cookie soft-revoked: TikTok returns HTTP 200 with empty
+                # item_list (login wall). Release the current term back to
+                # pending so it gets retried with the new cookie.
+                print(f"[auto-refresh] {consecutive_zero_results} consecutive zero-result "
+                      "terms — attempting silent cookie refresh", file=sys.stderr)
+                release_term(claimed_id)
+                claimed_id = None
+                if try_auto_refresh_with_backoff(account):
+                    consecutive_zero_results = 0
+                    time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
+                    continue
+
                 msg = (f"Web scraper halting: {consecutive_zero_results} consecutive "
-                       f"terms returned 0 saved videos. Cookie likely expired — "
-                       f"the login wall returns 200 + empty item_list. Last term: "
-                       f"{keyword!r}.")
+                       f"terms returned 0 saved videos and auto-refresh failed after "
+                       f"backoff. Login needed: VNC into VPS and run "
+                       f"`refresh_web_cookie.py --account {account} --fresh`. "
+                       f"Last term: {keyword!r}.")
                 print(f"[halt] {msg}", file=sys.stderr)
-                ntfy(msg, title="TikTok web scraper: halted, cookie likely expired",
-                     priority="high")
-                mark_term_done(claimed_id, saved)
+                ntfy(msg, title="TikTok web scraper: login required",
+                     priority="high", account=account)
                 sys.exit(1)
         else:
             consecutive_zero_results = 0
 
-        dt = time.time() - t0
+        elapsed = time.time() - t0
         mark_term_done(claimed_id, saved)
         claimed_id = None
-        print(f"[done] {keyword!r} saved={saved} reason={reason} elapsed={dt:.1f}s",
+        print(f"[done] {keyword!r} saved={saved} reason={reason} elapsed={elapsed:.1f}s",
               file=sys.stderr)
-        ntfy(f"{keyword!r}: saved {saved} videos ({reason}, {dt:.0f}s)",
-             title=f"TikTok web: {keyword}")
+        ntfy(f"{keyword!r}: saved {saved} videos ({reason}, {elapsed:.0f}s)",
+             title=f"TikTok web: {keyword}", account=account)
 
         pause = random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX)
         print(f"[sleep] {pause:.1f}s before next term", file=sys.stderr)

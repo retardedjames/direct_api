@@ -1,8 +1,15 @@
 """
-Template for web_cookie.py (gitignored). Copy this file to web_cookie.py
-and paste in a logged-in www.tiktok.com cookie + matching User-Agent.
+Template for accounts/<account>/cookie.py (gitignored). Each account has
+its own cookie.py under its own accounts/<account>/ directory. Copy this
+file to accounts/<account>/cookie.py and paste in a logged-in
+www.tiktok.com cookie + matching User-Agent.
 
-How to grab them:
+Normally you don't hand-create this — run:
+    python3 refresh_web_cookie.py --account <name> --fresh
+which opens a Chromium browser (under VNC), waits for you to log in, then
+writes the file for you.
+
+How to grab them manually (if needed):
   1. Log in at https://www.tiktok.com in any normal browser.
   2. DevTools → Network → reload the page.
   3. Click any request to www.tiktok.com → Headers tab.

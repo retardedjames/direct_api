@@ -17,8 +17,9 @@ Why this exists alongside scrape_keyword.py:
   - sort_type=2 + is_filter_search=1 = sort by LEAST liked (ascending).
     Useful for sampling the long tail; not what we usually want.
 
-Cookie source: web_cookie.py at the repo root (gitignored). Drop in your
-logged-in www.tiktok.com cookie + UA there. See web_cookie.example.py.
+Cookie source: accounts/<name>/cookie.py (gitignored). Each account has
+its own dir under accounts/. Use refresh_web_cookie.py --account <name>
+--fresh to populate one for the first time.
 
 Stop conditions: same as scrape_keyword.py
   1. has_more == 0
@@ -26,27 +27,54 @@ Stop conditions: same as scrape_keyword.py
   3. every item on a page < floor likes
 
 Usage:
-  python3 scrape_keyword_web.py mario
-  python3 scrape_keyword_web.py "kawaii desk" --floor 5000 --max-pages 30
-  python3 scrape_keyword_web.py mario --no-db
+  python3 scrape_keyword_web.py mario --account 20mythoughts
+  python3 scrape_keyword_web.py "kawaii desk" --account 20mythoughts \
+      --floor 5000 --max-pages 30
+  python3 scrape_keyword_web.py mario --account 20mythoughts --no-db
 """
 
 import argparse
 import gzip
+import importlib.util
 import json
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 try:
     import brotli
 except ImportError:
     import brotlicffi as brotli  # type: ignore
 
-from web_cookie import COOKIE, USER_AGENT
 from web_remap import web_to_mobile
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ACCOUNTS_DIR = PROJECT_DIR / "accounts"
+
+
+def account_cookie_path(account: str) -> Path:
+    return ACCOUNTS_DIR / account / "cookie.py"
+
+
+def load_cookie(account: str) -> tuple[str, str]:
+    """Load (COOKIE, USER_AGENT) for the given account from
+    accounts/<account>/cookie.py. Re-reading on every call (rather than
+    importing once) makes silent-reload-after-refresh trivial: the next
+    fetch_page() picks up the new file with no module-juggling."""
+    path = account_cookie_path(account)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"cookie file missing for account {account!r}: {path} "
+            f"(run refresh_web_cookie.py --account {account} --fresh to create it)")
+    spec = importlib.util.spec_from_file_location(f"_cookie_{account}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load cookie spec from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.COOKIE, mod.USER_AGENT
 
 PAGE_SIZE = 30
 LIKE_FLOOR = 1000
@@ -68,7 +96,7 @@ def _ms_token_from_cookie(cookie: str) -> str:
 
 def build_params(keyword: str, cursor: int, search_id: str = "",
                  sort_type: int = 1, publish_time: int = 0,
-                 count: int = PAGE_SIZE) -> dict:
+                 count: int = PAGE_SIZE, ms_token: str = "") -> dict:
     """sort_type: 0=default, 1=most-liked (descending), 2=least-liked
     (ascending). Sort only takes effect when is_filter_search=1, which
     this function always sets. publish_time: 0=all, 7/30/90/180=days."""
@@ -100,7 +128,7 @@ def build_params(keyword: str, cursor: int, search_id: str = "",
         "screen_width": "1920",
         "tz_name": "America/New_York",
         "webcast_language": "en",
-        "msToken": _ms_token_from_cookie(COOKIE),
+        "msToken": ms_token,
         "offset": str(cursor),
         "count": str(count),
         "sort_type": str(sort_type),
@@ -117,12 +145,16 @@ def build_params(keyword: str, cursor: int, search_id: str = "",
 
 
 def fetch_page(keyword: str, cursor: int, search_id: str,
-               sort_type: int = 1, publish_time: int = 0):
-    params = build_params(keyword, cursor, search_id, sort_type, publish_time)
+               sort_type: int = 1, publish_time: int = 0,
+               *, account: str):
+    cookie, user_agent = load_cookie(account)
+    ms_token = _ms_token_from_cookie(cookie)
+    params = build_params(keyword, cursor, search_id, sort_type, publish_time,
+                          ms_token=ms_token)
     url = ENDPOINT + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT,
-        "Cookie": COOKIE,
+        "User-Agent": user_agent,
+        "Cookie": cookie,
         "Accept": "*/*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
@@ -174,7 +206,8 @@ def summarise(item_mobile: dict) -> dict:
 
 
 def scrape(keyword: str, floor: int, max_pages: int, out_fh,
-           sort_type: int = 1, publish_time: int = 0):
+           sort_type: int = 1, publish_time: int = 0,
+           *, account: str):
     seen_ids: set[str] = set()
     collected_mobile: list[dict] = []
     page = 0
@@ -187,7 +220,8 @@ def scrape(keyword: str, floor: int, max_pages: int, out_fh,
         print(f"[page {page}] cursor={cursor} search_id={search_id[:16] + '...' if search_id else '(empty)'}",
               file=sys.stderr)
         parsed, impr_id, fetch_ms = fetch_page(keyword, cursor, search_id,
-                                               sort_type, publish_time)
+                                               sort_type, publish_time,
+                                               account=account)
         item_list = parsed.get("item_list") or []
         has_more = parsed.get("has_more")
         next_cursor = parsed.get("cursor")
@@ -246,6 +280,8 @@ def scrape(keyword: str, floor: int, max_pages: int, out_fh,
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("keyword")
+    ap.add_argument("--account", type=str, required=True,
+                    help="account name (looks up accounts/<name>/cookie.py)")
     ap.add_argument("--floor", type=int, default=LIKE_FLOOR)
     ap.add_argument("--max-pages", type=int, default=MAX_PAGES_DEFAULT)
     ap.add_argument("--sort-type", type=int, default=1,
@@ -260,7 +296,8 @@ def main():
     t0 = time.time()
     try:
         total, reason, raws = scrape(args.keyword, args.floor, args.max_pages,
-                                     out_fh, args.sort_type, args.publish_time)
+                                     out_fh, args.sort_type, args.publish_time,
+                                     account=args.account)
     finally:
         if out_fh is not sys.stdout:
             out_fh.close()

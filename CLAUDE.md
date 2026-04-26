@@ -1,10 +1,17 @@
 # direct_api — pure-HTTP TikTok web scraper
 
 Scrapes TikTok's logged-in **web** search API (`www.tiktok.com/api/search/item/full/`)
-with one logged-in browser cookie. No mobile signing, no Frida, no Waydroid.
+with logged-in browser cookies. No mobile signing, no Frida, no Waydroid.
 Runs 24/7 on the Oracle VPS under systemd; auto-recovers from cookie rot
 via a headless Playwright refresh; only pages the human (ntfy) when the
 account itself needs a fresh login.
+
+**Multi-account:** each account has its own dir under `accounts/<name>/`
+(cookie + Chromium profile). One templated systemd unit per account
+(`tiktok-web-scraper@<name>.service`) — workers share the queue via
+`FOR UPDATE SKIP LOCKED`, so parallel-safe by construction. Per-account
+daily quota (`status_code=2484`) means one account getting throttled
+doesn't block the others.
 
 > **Ignore everything in `OLD/`.** That directory holds the archived
 > mobile/Frida/Waydroid scraper stack (Frida-signed `/aweme/v1/search/item/`
@@ -22,14 +29,18 @@ account itself needs a fresh login.
    you ──VNC :5901──────▶ │  Xvnc + xfce4 (display :1)       │
    (only when login       │      └─ Chromium (logged-in)     │
     needed; "james" pw)   │                                  │
-                          │  systemd --user                  │
-                          │  └─ tiktok-web-scraper.service   │
+                          │  systemd --user (templated)      │
+                          │  ├─ tiktok-web-scraper@20mythoughts.service │
+                          │  ├─ tiktok-web-scraper@21mythoughts.service │
+                          │  └─ ...                          │
                           │       continual_scraper_web.py   │
+                          │           --account <name>       │
                           │           ├─ scrape_keyword_web  │
                           │           │     /api/search/...  │
                           │           ├─ db.save_search ──┐  │
                           │           └─ on cookie rot:   │  │
                           │              refresh --auto   │  │
+                          │              --account <name> │  │
                           │                               ▼  │
                           │  PostgreSQL (local)              │
                           │  ntfy server :2586               │

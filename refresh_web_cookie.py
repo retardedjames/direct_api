@@ -1,37 +1,34 @@
 """
 Open a Chromium browser so you can log in / search on tiktok.com, then
-read the cookies back out of the browser context and rewrite web_cookie.py.
-After writing, verify with a real /api/search/item/full/ call. Optionally
-reset failed terms and relaunch continual_scraper_web.py.
+read the cookies back out of the browser context and rewrite the
+account's cookie.py. After writing, verify with a real
+/api/search/item/full/ call.
+
+Per-account layout — every account has its own dir:
+  accounts/<account>/cookie.py
+  accounts/<account>/playwright_profile/
 
 Usage:
-  python3 refresh_web_cookie.py                  # refresh + verify
-  python3 refresh_web_cookie.py --restart        # also relaunch the scraper
-  python3 refresh_web_cookie.py --restart \
-      --reset-failed 1190,1191,1192              # also flip those rows back to pending
+  python3 refresh_web_cookie.py --account 20mythoughts
+  python3 refresh_web_cookie.py --account 20mythoughts --fresh
+  python3 refresh_web_cookie.py --account 20mythoughts --auto
 
 The script:
-  1. Launches Chromium with a persistent profile under
-     ./.playwright_profile/  (so you stay logged in across runs).
+  1. Launches Chromium with the account's persistent profile so you stay
+     logged in across runs.
   2. Navigates to www.tiktok.com.
-  3. Waits until it sees a request to /api/search/ — that proves the
-     session is real (not a login wall) before we trust the cookies.
+  3. (Headed mode) Waits for you to log in and signal "ready"; (--auto)
+     navigates to a search page, waits for networkidle, grabs cookies.
   4. Reads context.cookies() for .tiktok.com, formats them into the
-     same `name=value; ...` string web_cookie.py expects, and rewrites
-     the file in place. USER_AGENT is taken live from the browser so
-     it always matches the session.
-  5. Verifies by importlib.reload-ing scrape_keyword_web and doing one
-     fetch_page() call against a benign keyword. Aborts if it fails.
-  6. (Optional) Resets the given term ids back to pending.
-  7. (Optional) Relaunches continual_scraper_web.py in a new logfile.
+     `name=value; ...` string the scraper expects, and rewrites
+     accounts/<account>/cookie.py. USER_AGENT is taken live from the
+     browser so it always matches the session.
+  5. Verifies with a real fetch_page() call against a benign keyword.
 """
 
 import argparse
-import datetime as dt
-import importlib
 import re
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -40,9 +37,13 @@ from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
 PROJECT_DIR = Path(__file__).resolve().parent
-COOKIE_FILE = PROJECT_DIR / "web_cookie.py"
-PROFILE_DIR = PROJECT_DIR / ".playwright_profile"
-LOG_DIR = PROJECT_DIR / "logs"
+ACCOUNTS_DIR = PROJECT_DIR / "accounts"
+
+
+def account_paths(account: str) -> tuple[Path, Path]:
+    """Return (cookie_file, profile_dir) for the given account."""
+    base = ACCOUNTS_DIR / account
+    return base / "cookie.py", base / "playwright_profile"
 
 SEARCH_URL_PATTERN = re.compile(r"tiktok\.com/api/(search|recommend|item|post|user|aweme)/")
 VERIFY_KEYWORD = "mario"
@@ -58,7 +59,7 @@ def format_cookie_header(cookies: list[dict]) -> str:
     return "; ".join(parts)
 
 
-def write_cookie_file(cookie_str: str, user_agent: str) -> None:
+def write_cookie_file(cookie_file: Path, cookie_str: str, user_agent: str) -> None:
     body = (
         '"""Logged-in www.tiktok.com cookie for the web-search scraper.\n\n'
         'Gitignored. Auto-written by refresh_web_cookie.py — do not hand-edit\n'
@@ -68,18 +69,20 @@ def write_cookie_file(cookie_str: str, user_agent: str) -> None:
         f'COOKIE = (\n    {cookie_str!r}\n)\n\n'
         f'USER_AGENT = (\n    {user_agent!r}\n)\n'
     )
-    COOKIE_FILE.write_text(body)
+    cookie_file.parent.mkdir(parents=True, exist_ok=True)
+    cookie_file.write_text(body)
 
 
-def grab_cookies(ready_signal_path: Path | None, auto: bool) -> tuple[str, str]:
-    PROFILE_DIR.mkdir(exist_ok=True)
+def grab_cookies(profile_dir: Path, ready_signal_path: Path | None,
+                 auto: bool) -> tuple[str, str]:
+    profile_dir.mkdir(parents=True, exist_ok=True)
     # playwright-stealth patches the standard automation tells (navigator.webdriver,
     # missing chrome.runtime, headless UA hints, WebGL vendor strings, etc.).
     # Without these patches TikTok flags the session as a bot.
     stealth = Stealth()
     with stealth.use_sync(sync_playwright()) as p:
         ctx = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR),
+            str(profile_dir),
             headless=False,
             viewport={"width": 1280, "height": 800},
             args=[
@@ -164,20 +167,18 @@ EXIT_RATE_LIMITED = 2
 RATE_LIMIT_STATUS_CODE = 2484
 
 
-def verify_cookie() -> str:
-    """Force-reload web_cookie + scrape_keyword_web (in case they were
-    imported earlier with the stale cookie), then do one real page-0 fetch.
+def verify_cookie(account: str) -> str:
+    """Do one real page-0 fetch using the account's freshly-written cookie.
+    No importlib dance needed: scrape_keyword_web reads the cookie file on
+    every fetch, so the new file is picked up automatically.
     Returns one of VERIFY_OK / VERIFY_RATE_LIMITED / VERIFY_FAIL."""
-    import web_cookie
-    importlib.reload(web_cookie)
-    if "scrape_keyword_web" in sys.modules:
-        skw = importlib.reload(sys.modules["scrape_keyword_web"])
-    else:
-        import scrape_keyword_web as skw
+    import scrape_keyword_web as skw
 
-    print(f"[verify] fetching page 0 for {VERIFY_KEYWORD!r}...", file=sys.stderr)
+    print(f"[verify] fetching page 0 for {VERIFY_KEYWORD!r} (account={account})...",
+          file=sys.stderr)
     try:
-        parsed, impr_id, fetch_ms = skw.fetch_page(VERIFY_KEYWORD, 0, "", 1, 0)
+        parsed, impr_id, fetch_ms = skw.fetch_page(VERIFY_KEYWORD, 0, "", 1, 0,
+                                                    account=account)
     except Exception as e:
         print(f"[verify] FAIL: {type(e).__name__}: {e}", file=sys.stderr)
         return VERIFY_FAIL
@@ -204,100 +205,60 @@ def verify_cookie() -> str:
     return VERIFY_OK
 
 
-def reset_failed_terms(term_ids: list[int]) -> None:
-    from sqlalchemy import text
-    from db import engine
-    with engine.begin() as conn:
-        result = conn.execute(
-            text("UPDATE terms SET status='pending', started_at=NULL, "
-                 "completed_at=NULL WHERE id = ANY(:ids) AND status='failed'"),
-            {"ids": term_ids},
-        )
-        print(f"[reset] flipped {result.rowcount} failed term(s) back to pending",
-              file=sys.stderr)
-
-
-def restart_scraper() -> None:
-    LOG_DIR.mkdir(exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_path = LOG_DIR / f"continual_web_{stamp}.log"
-    cmd = ["python3", "-u", str(PROJECT_DIR / "continual_scraper_web.py")]
-    log_fh = open(log_path, "w")
-    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
-                            cwd=str(PROJECT_DIR), start_new_session=True)
-    # Update the tmp pointer continual_scraper_web.py uses to find its log.
-    Path("/tmp/web_scraper_logfile.txt").write_text(
-        str(log_path.relative_to(PROJECT_DIR)) + "\n")
-    print(f"[restart] launched continual_scraper_web.py pid={proc.pid}",
-          file=sys.stderr)
-    print(f"[restart] log: {log_path}", file=sys.stderr)
-    print(f"[restart] tail: tail -f {log_path}", file=sys.stderr)
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ready-signal", type=str,
-                    default="/tmp/refresh_web_cookie.ready",
+    ap.add_argument("--account", type=str, required=True,
+                    help="account name (paths derived: accounts/<name>/cookie.py "
+                         "and accounts/<name>/playwright_profile/)")
+    ap.add_argument("--ready-signal", type=str, default="",
                     help="path to touch from another shell to signal 'grab "
-                         "cookies now' (default /tmp/refresh_web_cookie.ready)")
+                         "cookies now'. Defaults to "
+                         "/tmp/refresh_web_cookie.<account>.ready")
     ap.add_argument("--auto", action="store_true",
                     help="non-interactive: navigate to /search?q=help, wait for "
                          "page settle, grab cookies. Use when re-using an existing "
                          "logged-in profile (no human needed).")
     ap.add_argument("--no-verify", action="store_true",
                     help="skip the verification fetch")
-    ap.add_argument("--reset-failed", type=str, default="",
-                    help="comma-separated term ids to flip from failed→pending "
-                         "after a successful verify (e.g. 1190,1191,1192)")
-    ap.add_argument("--restart", action="store_true",
-                    help="relaunch continual_scraper_web.py after verify")
     ap.add_argument("--fresh", action="store_true",
                     help="delete the persistent Chromium profile before launching "
                          "(forces fresh login, drops any flagged fingerprint state)")
     args = ap.parse_args()
 
-    if args.fresh and PROFILE_DIR.exists():
-        print(f"[refresh] --fresh: removing {PROFILE_DIR}", file=sys.stderr)
-        shutil.rmtree(PROFILE_DIR)
+    cookie_file, profile_dir = account_paths(args.account)
+    ready_signal = Path(args.ready_signal) if args.ready_signal else \
+        Path(f"/tmp/refresh_web_cookie.{args.account}.ready")
+
+    if args.fresh and profile_dir.exists():
+        print(f"[refresh] --fresh: removing {profile_dir}", file=sys.stderr)
+        shutil.rmtree(profile_dir)
 
     cookie_str, user_agent = grab_cookies(
-        Path(args.ready_signal) if not args.auto else None,
+        profile_dir,
+        ready_signal if not args.auto else None,
         auto=args.auto,
     )
     if "sessionid=" not in cookie_str or "sid_guard=" not in cookie_str:
         print("[refresh] WARNING: cookie missing sessionid/sid_guard — "
               "you may not be logged in. Writing anyway.", file=sys.stderr)
-    write_cookie_file(cookie_str, user_agent)
+    write_cookie_file(cookie_file, cookie_str, user_agent)
     n_cookies = cookie_str.count(";") + 1 if cookie_str else 0
-    print(f"[refresh] wrote {COOKIE_FILE} ({n_cookies} cookies, "
+    print(f"[refresh] wrote {cookie_file} ({n_cookies} cookies, "
           f"UA len={len(user_agent)})", file=sys.stderr)
 
     if args.no_verify:
         print("[refresh] --no-verify: skipping verification", file=sys.stderr)
     else:
-        result = verify_cookie()
+        result = verify_cookie(args.account)
         if result == VERIFY_RATE_LIMITED:
             print("[refresh] cookie was written but account is rate-limited — "
                   "exiting with code 2 (caller should sleep, not re-login)",
                   file=sys.stderr)
             sys.exit(EXIT_RATE_LIMITED)
         if result != VERIFY_OK:
-            print("[refresh] verification failed — NOT resetting terms or "
-                  "restarting scraper. Try refresh again.", file=sys.stderr)
-            sys.exit(EXIT_FAIL)
-
-    if args.reset_failed:
-        try:
-            ids = [int(x) for x in args.reset_failed.split(",") if x.strip()]
-        except ValueError:
-            print(f"[refresh] bad --reset-failed value: {args.reset_failed!r}",
+            print("[refresh] verification failed. Try refresh again.",
                   file=sys.stderr)
-            sys.exit(2)
-        if ids:
-            reset_failed_terms(ids)
-
-    if args.restart:
-        restart_scraper()
+            sys.exit(EXIT_FAIL)
 
     print("[refresh] done.", file=sys.stderr)
 
