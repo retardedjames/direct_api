@@ -5,8 +5,8 @@
 # Usage on the VM:
 #   bash ~/direct_api/scripts/clone_finalize.sh [vm_label]
 #
-# vm_label defaults to "vm$(date +%s | tail -c 4)" if not supplied — a
-# locally-unique label for this VM. The label only matters for:
+# vm_label is auto-generated as "vm<5-digit-random>" if not supplied. The
+# label is purely local — it only matters for:
 #   - the filename replay_search_<label>.py (gitignored)
 #   - the TIKTOK_ACCOUNT env var (drives import dispatch)
 #   - the NTFY_PREFIX env var (so notifications show which worker)
@@ -17,7 +17,17 @@ set -euo pipefail
 log() { printf '\n\033[1;34m[finalize]\033[0m %s\n' "$*"; }
 err() { printf '\n\033[1;31m[finalize ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-LABEL="${1:-vm$(date +%s | tail -c 4)}"
+# Auto-pick a random label if none given. Re-roll on the unlikely chance
+# that replay_search_<label>.py already exists locally.
+gen_label() {
+    local n
+    while :; do
+        n=$(( (RANDOM * 32768 + RANDOM) % 90000 + 10000 ))
+        [ -e "$HOME/direct_api/replay_search_vm${n}.py" ] || { echo "vm$n"; return; }
+    done
+}
+
+LABEL="${1:-$(gen_label)}"
 [[ "$LABEL" =~ ^vm[0-9]+$ ]] || err "label must match /^vm[0-9]+$/, got '$LABEL'"
 
 REPO=$HOME/direct_api

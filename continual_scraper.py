@@ -59,7 +59,7 @@ INTER_TERM_SLEEP_MIN = 15   # seconds
 INTER_TERM_SLEEP_MAX = 45
 INTER_PAGE_SLEEP_MIN = 0.5
 INTER_PAGE_SLEEP_MAX = 2.0
-REJECT_BACKOFF_SECONDS = 600  # 10 minutes after a suspected silent-reject
+REJECT_BACKOFF_SECONDS = 300  # 5 minutes after a suspected silent-reject
 
 SILENT_REJECT_SST_MS = 200  # anything below this with empty aweme_list → rejected
 
@@ -250,7 +250,7 @@ def main():
             mark_term_failed(claimed_id)
             claimed_id = None
 
-            if consecutive_rejects >= 2:
+            if consecutive_rejects >= 3:
                 msg = (f"Continual scraper halting: {consecutive_rejects} consecutive "
                        f"silent-rejects. Signer or session likely dead. "
                        f"Last term: {keyword!r}.")

@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 from sqlalchemy import (
     create_engine, Column, BigInteger, Integer, Text, Boolean,
-    DateTime, ForeignKey, UniqueConstraint
+    DateTime, ForeignKey, UniqueConstraint, text
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import DeclarativeBase, relationship, Session
@@ -243,6 +243,88 @@ def save_search(keyword: str, sort_type: str, aweme_infos: list[dict]) -> int:
 
         session.commit()
         return len(seen_ids)
+
+
+# ---------------------------------------------------------------------------
+# Queue helpers for the `terms` table (owned/populated externally; schema:
+# id, term, type, status, added_at, started_at, completed_at, videos_saved,
+# done_old_way). Used by continual_scraper.py.
+# ---------------------------------------------------------------------------
+
+
+def reclaim_stale_terms(stale_after_minutes: int = 30) -> int:
+    """Reset `in_progress` rows whose started_at is older than the cutoff
+    back to `pending`. Handles crashed/killed scraper runs."""
+    sql = text("""
+        UPDATE terms
+           SET status = 'pending',
+               started_at = NULL
+         WHERE status = 'in_progress'
+           AND type = 'search'
+           AND started_at < now() - (:mins || ' minutes')::interval
+        RETURNING id
+    """)
+    with engine.begin() as conn:
+        rows = conn.execute(sql, {"mins": str(stale_after_minutes)}).fetchall()
+    return len(rows)
+
+
+def claim_next_term() -> dict | None:
+    """Atomically claim one pending search term: flip status to in_progress
+    and return its row. Uses FOR UPDATE SKIP LOCKED so parallel workers
+    never collide. Returns None if nothing to claim."""
+    sql = text("""
+        UPDATE terms
+           SET status = 'in_progress',
+               started_at = now()
+         WHERE id = (
+             SELECT id FROM terms
+              WHERE status = 'pending' AND type = 'search'
+              ORDER BY id
+              FOR UPDATE SKIP LOCKED
+              LIMIT 1
+         )
+        RETURNING id, term, type, status, added_at, started_at
+    """)
+    with engine.begin() as conn:
+        row = conn.execute(sql).mappings().fetchone()
+    return dict(row) if row else None
+
+
+def mark_term_done(term_id: int, videos_saved: int) -> None:
+    sql = text("""
+        UPDATE terms
+           SET status = 'done',
+               completed_at = now(),
+               videos_saved = :vs
+         WHERE id = :id
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, {"id": term_id, "vs": videos_saved})
+
+
+def mark_term_failed(term_id: int) -> None:
+    sql = text("""
+        UPDATE terms
+           SET status = 'failed',
+               completed_at = now()
+         WHERE id = :id
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, {"id": term_id})
+
+
+def release_term(term_id: int) -> None:
+    """Return an in_progress row to the pending pool (e.g. on Ctrl-C before
+    the scrape finishes). Does not touch rows in other states."""
+    sql = text("""
+        UPDATE terms
+           SET status = 'pending',
+               started_at = NULL
+         WHERE id = :id AND status = 'in_progress'
+    """)
+    with engine.begin() as conn:
+        conn.execute(sql, {"id": term_id})
 
 
 if __name__ == "__main__":

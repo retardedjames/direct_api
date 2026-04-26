@@ -91,15 +91,14 @@ worked but gets flagged sometimes.
 
 ## Phase 4 — finalize
 
-Pick any `vmN` label that's locally unique on this VM (used for the
-identity file name + the `TIKTOK_ACCOUNT` env var). The label is purely
-local — it doesn't need to match anything on other VMs and there's
-nothing to coordinate.
-
 ```bash
 ssh -i ~/.ssh/jamescvermont jamescvermont@$NEW_IP \
-    'bash ~/direct_api/scripts/clone_finalize.sh vmN'
+    'bash ~/direct_api/scripts/clone_finalize.sh'
 ```
+
+The script auto-picks a random `vmNNNNN` label (used for the identity
+file name + `TIKTOK_ACCOUNT` env var). The label is purely local — pass
+an explicit one as an arg only if you have a reason to.
 
 This:
 
@@ -134,7 +133,7 @@ Most common cause: VNC signup wasn't completed (cookie store has no
 | Smoke test: `SILENT-REJECT sst=~80ms` | Bad signature — version mismatch | TT Lite versionCode must be 430553 (the value the signer agent expects). If it differs, the image is stale and the APK splits in `~/ttapk/` need re-pulling from a real phone capture. |
 | Smoke test: `frida.ProcessNotFoundError` | TT Lite died after launch | `adb -s 127.0.0.1:5556 shell am start -n com.tiktok.lite.go/com.ss.android.ugc.aweme.main.homepage.MainActivity` then re-run finalize |
 | Smoke test: `adb: device '...' not found` | Display stack didn't fully come up | `bash scripts/vm2_start_display.sh` then re-run finalize |
-| Capture aborts: missing session cookies | VNC signup not complete | Finish signup in VNC, re-run `clone_finalize.sh vmN` |
+| Capture aborts: missing session cookies | VNC signup not complete | Finish signup in VNC, re-run `clone_finalize.sh` |
 | Every VNC tap triggers "System UI isn't responding" | InputDispatcher wedged | `clone_bootstrap.sh` already handles this; if it recurs, repeat: get pid via `adb shell pidof com.android.systemui`, kill via `sudo lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- kill -9 <pid>` |
 
 ## Maintenance — when to refresh the source image
