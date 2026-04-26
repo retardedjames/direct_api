@@ -1,15 +1,8 @@
 """
-Web-endpoint twin of continual_scraper.py.
-
-Pulls pending search terms from the `terms` queue, scrapes them via
-www.tiktok.com/api/search/item/full/, upserts to Postgres, pings ntfy.
-
-Key differences from continual_scraper.py:
-  - No FridaSigner. No TIKTOK_ACCOUNT env var. No Waydroid.
-  - One web cookie (web_cookie.py) authenticates all requests.
-  - "Silent reject" detection works differently: the web endpoint
-    doesn't return server_stream_time. Instead we watch for HTTP errors,
-    sudden empty item_list on page 0, or status_code != 0 in the JSON.
+24/7 web-search scraper. Pulls pending terms from the `terms` queue,
+scrapes www.tiktok.com/api/search/item/full/, upserts to Postgres, pings
+ntfy. Auto-recovers from cookie rot via refresh_web_cookie.py --auto.
+Halts (with ntfy) only when a fresh login is needed.
 """
 
 import argparse

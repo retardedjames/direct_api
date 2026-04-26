@@ -248,7 +248,7 @@ def save_search(keyword: str, sort_type: str, aweme_infos: list[dict]) -> int:
 # ---------------------------------------------------------------------------
 # Queue helpers for the `terms` table (owned/populated externally; schema:
 # id, term, type, status, added_at, started_at, completed_at, videos_saved,
-# done_old_way). Used by continual_scraper.py.
+# done_old_way). Used by continual_scraper_web.py.
 # ---------------------------------------------------------------------------
 
 
