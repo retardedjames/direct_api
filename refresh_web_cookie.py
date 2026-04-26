@@ -148,10 +148,26 @@ def grab_cookies(ready_signal_path: Path | None, auto: bool) -> tuple[str, str]:
     return cookie_str, user_agent
 
 
-def verify_cookie() -> bool:
+# Verify-result codes — also used as process exit codes so the scraper can
+# distinguish "rate-limited, wait it out" from "real login required".
+VERIFY_OK = "ok"
+VERIFY_RATE_LIMITED = "rate_limited"  # status_code=2484 "Try again in 1 hour"
+VERIFY_FAIL = "fail"
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_RATE_LIMITED = 2
+
+# TikTok web rate-limit code. Confirmed 2026-04-26: status_msg = "Too many
+# attempts. Try again in 1 hour." Account-level, not cookie-level — the
+# cookie is fine, just sleep it off.
+RATE_LIMIT_STATUS_CODE = 2484
+
+
+def verify_cookie() -> str:
     """Force-reload web_cookie + scrape_keyword_web (in case they were
     imported earlier with the stale cookie), then do one real page-0 fetch.
-    Returns True iff status_code==0 and item_list is non-empty."""
+    Returns one of VERIFY_OK / VERIFY_RATE_LIMITED / VERIFY_FAIL."""
     import web_cookie
     importlib.reload(web_cookie)
     if "scrape_keyword_web" in sys.modules:
@@ -164,23 +180,28 @@ def verify_cookie() -> bool:
         parsed, impr_id, fetch_ms = skw.fetch_page(VERIFY_KEYWORD, 0, "", 1, 0)
     except Exception as e:
         print(f"[verify] FAIL: {type(e).__name__}: {e}", file=sys.stderr)
-        return False
+        return VERIFY_FAIL
 
     item_list = parsed.get("item_list") or []
     status_code = parsed.get("status_code")
     print(f"[verify] fetch={fetch_ms}ms items={len(item_list)} "
           f"status_code={status_code}", file=sys.stderr)
 
+    if status_code == RATE_LIMIT_STATUS_CODE:
+        print(f"[verify] RATE-LIMITED: status_code={status_code} "
+              f"status_msg={parsed.get('status_msg')!r} — cookie is fine, "
+              "account is throttled", file=sys.stderr)
+        return VERIFY_RATE_LIMITED
     if status_code not in (0, None):
         print(f"[verify] FAIL: status_code={status_code} "
               f"status_msg={parsed.get('status_msg')!r}", file=sys.stderr)
-        return False
+        return VERIFY_FAIL
     if not item_list:
         print("[verify] FAIL: item_list empty (silent-reject pattern)",
               file=sys.stderr)
-        return False
+        return VERIFY_FAIL
     print("[verify] OK", file=sys.stderr)
-    return True
+    return VERIFY_OK
 
 
 def reset_failed_terms(term_ids: list[int]) -> None:
@@ -254,10 +275,16 @@ def main():
     if args.no_verify:
         print("[refresh] --no-verify: skipping verification", file=sys.stderr)
     else:
-        if not verify_cookie():
+        result = verify_cookie()
+        if result == VERIFY_RATE_LIMITED:
+            print("[refresh] cookie was written but account is rate-limited — "
+                  "exiting with code 2 (caller should sleep, not re-login)",
+                  file=sys.stderr)
+            sys.exit(EXIT_RATE_LIMITED)
+        if result != VERIFY_OK:
             print("[refresh] verification failed — NOT resetting terms or "
                   "restarting scraper. Try refresh again.", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(EXIT_FAIL)
 
     if args.reset_failed:
         try:

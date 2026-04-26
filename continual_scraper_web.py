@@ -47,10 +47,23 @@ def _reload_scraper():
         _load_scraper()
 
 
-def attempt_auto_refresh() -> bool:
-    """Run refresh_web_cookie.py --auto in a subprocess. Returns True on
-    success (verified live), False on any failure. Inherits DISPLAY env so
-    the headed-but-on-VNC Chromium can render."""
+# Exit codes from refresh_web_cookie.py — must match the constants there.
+REFRESH_EXIT_OK = 0
+REFRESH_EXIT_FAIL = 1
+REFRESH_EXIT_RATE_LIMITED = 2
+
+# Backoff schedule for self-healing on auto-refresh failure. Each entry is
+# (sleep_seconds, label). After the last attempt fails, ntfy + exit. The
+# rate-limited path skips straight to the long sleeps since shorter retries
+# are pointless during a 1-hour TikTok throttle.
+REFRESH_BACKOFF_NORMAL = [(300, "5min"), (900, "15min"), (3600, "60min")]
+REFRESH_BACKOFF_RATE_LIMITED = [(3600, "60min"), (3600, "60min")]
+
+
+def attempt_auto_refresh() -> int:
+    """Run refresh_web_cookie.py --auto in a subprocess. Returns the
+    refresh script's exit code: 0=ok, 1=fail, 2=rate-limited. Inherits
+    DISPLAY env so the headed-but-on-VNC Chromium can render."""
     script = Path(__file__).resolve().parent / "refresh_web_cookie.py"
     print("[auto-refresh] running refresh_web_cookie.py --auto", file=sys.stderr)
     try:
@@ -60,10 +73,10 @@ def attempt_auto_refresh() -> bool:
         )
     except subprocess.TimeoutExpired:
         print("[auto-refresh] TIMEOUT after 120s", file=sys.stderr)
-        return False
+        return REFRESH_EXIT_FAIL
     print(result.stdout, file=sys.stderr)
     print(result.stderr, file=sys.stderr)
-    return result.returncode == 0
+    return result.returncode
 
 NTFY_TOPIC = "retardedjames-tiktok"
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "http://150.136.40.239:2586")
@@ -316,9 +329,16 @@ def main():
                 # is usually still good — TikTok just rotated msToken / soft-
                 # revoked the session. A quick navigate-to-search-page in the
                 # same profile typically gives us a fresh cookie.
+                #
+                # If that fails we don't immediately escalate: the most common
+                # "won't recover" cause is account-level rate-limiting (~1 hour
+                # throttle), which looks identical to a dead cookie at the
+                # response level (HTTP 200 + empty body). So we retry on a
+                # backoff schedule before deciding it's a real login problem.
                 print(f"[auto-refresh] {consecutive_errors} consecutive errors — "
                       "attempting silent cookie refresh", file=sys.stderr)
-                if attempt_auto_refresh():
+                rc = attempt_auto_refresh()
+                if rc == REFRESH_EXIT_OK:
                     print("[auto-refresh] success — reloading modules + resuming",
                           file=sys.stderr)
                     _reload_scraper()
@@ -326,15 +346,44 @@ def main():
                     time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
                     continue
 
-                # Auto-refresh failed → real login is needed (account expired,
-                # TikTok flagged the profile, etc.). Ntfy + exit; systemd will
-                # restart us, which will keep failing the auto-refresh, but at
-                # rate-limited intervals — until the human VNCs in and runs
-                # `refresh_web_cookie.py --fresh`.
-                msg = (f"Web scraper halting: auto-refresh failed after "
-                       f"{consecutive_errors} consecutive errors. Login needed: "
-                       f"VNC into VPS and run `refresh_web_cookie.py --fresh`. "
-                       f"Last: {type(e).__name__}: {e}. Last term: {keyword!r}.")
+                # Pick backoff schedule. Rate-limited → long sleeps only; other
+                # failures → escalating 5/15/60 min retries.
+                if rc == REFRESH_EXIT_RATE_LIMITED:
+                    print("[auto-refresh] account rate-limited — waiting it out",
+                          file=sys.stderr)
+                    schedule = REFRESH_BACKOFF_RATE_LIMITED
+                else:
+                    schedule = REFRESH_BACKOFF_NORMAL
+
+                recovered = False
+                for sleep_s, label in schedule:
+                    print(f"[auto-refresh] sleeping {label} before retry...",
+                          file=sys.stderr)
+                    time.sleep(sleep_s)
+                    rc = attempt_auto_refresh()
+                    if rc == REFRESH_EXIT_OK:
+                        print(f"[auto-refresh] success after {label} backoff — "
+                              "reloading modules + resuming", file=sys.stderr)
+                        _reload_scraper()
+                        consecutive_errors = 0
+                        recovered = True
+                        break
+                    print(f"[auto-refresh] retry after {label} still failing "
+                          f"(rc={rc})", file=sys.stderr)
+
+                if recovered:
+                    time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
+                    continue
+
+                # All backoff retries exhausted → real login needed (account
+                # banned, profile flagged, etc.). Ntfy + exit. Systemd will
+                # restart and the cycle repeats at rate-limited cadence until
+                # the human VNCs in and runs `refresh_web_cookie.py --fresh`.
+                msg = (f"Web scraper halting: auto-refresh failed after backoff "
+                       f"retries. Login needed: VNC into VPS and run "
+                       f"`refresh_web_cookie.py --fresh`. "
+                       f"Last error: {type(e).__name__}: {e}. "
+                       f"Last term: {keyword!r}.")
                 print(f"[halt] {msg}", file=sys.stderr)
                 ntfy(msg, title="TikTok web scraper: login required",
                      priority="high")
