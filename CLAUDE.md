@@ -86,6 +86,7 @@ just `24`.
 |---|---|---|---|
 | `150.136.40.239` (Oracle ARM64, Ubuntu 24.04) | `ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239` | `20mythoughts`, `21mythoughts`, `23mythoughts` | Also hosts Postgres + ntfy. VNC `:5901`, password `james`, **publicly reachable**. |
 | `34.148.104.145` (GCP us-east1-c, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.148.104.145` | `24` | Hostname `try2`. Xtigervnc `:1` / 5901, **localhost-only** (`-localhost=1`) — SSH-tunnel `-L 5901:localhost:5901` to reach it. |
+| `34.182.184.254` (GCP us-east4-b, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.182.184.254` | `25` | Hostname `again1`. Same VNC pattern (localhost-only, SSH-tunnel). Cloned from `try2`, so its initial `accounts/24/` was wiped during bring-up. |
 
 When a new VM joins the fleet, append a row here.
 
