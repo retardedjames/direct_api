@@ -93,10 +93,13 @@ INTER_PAGE_SLEEP_MIN = 0.5
 INTER_PAGE_SLEEP_MAX = 2.0
 REJECT_BACKOFF_SECONDS = 300
 
-# If many consecutive terms come back with zero items on page 0, the cookie
-# is probably expired/revoked — TikTok serves a 200 with an empty list rather
-# than an error. Flag it as a session failure once we hit this many in a row.
-ZERO_RESULT_HALT_THRESHOLD = 5
+# If many consecutive terms come back with zero raw items on page 0, the
+# cookie is probably expired/revoked — TikTok serves a 200 with an empty
+# list rather than an error. Flag it as a session failure once we hit this
+# many in a row. Only counts terms where the API returned ZERO items
+# (suspected cookie rot); a term that returned items but all under the
+# like floor is a legit empty result and does not increment the counter.
+ZERO_RESULT_HALT_THRESHOLD = 4
 
 # Generic per-term exceptions (JSONDecodeError, network errors, etc.) used
 # to be tolerated forever — leading to silent queue burn when the cookie
@@ -240,7 +243,10 @@ def scrape_one(keyword: str, floor: int, max_pages: int,
 
 def run_once(term: dict, floor: int, max_pages: int,
              sort_type: int, publish_time: int,
-             *, account: str) -> tuple[int, str]:
+             *, account: str) -> tuple[int, int, str]:
+    """Returns (saved, total_raw, stop_reason). `total_raw` is the unfiltered
+    item count returned by the API — distinguishes cookie-rot (total_raw=0)
+    from legitimate empty results (total_raw>0 but all under the like floor)."""
     keyword = term["term"]
     total, reason, raws = scrape_one(keyword, floor, max_pages, sort_type,
                                      publish_time, account=account)
@@ -250,11 +256,11 @@ def run_once(term: dict, floor: int, max_pages: int,
     if not to_save:
         print(f"  [db] nothing to save ({len(raws)} scraped, {dropped} under floor)",
               file=sys.stderr)
-        return 0, reason
+        return 0, total, reason
     saved = save_search(keyword, str(sort_type), to_save)
     print(f"  [db] saved {saved} videos ({dropped} under {floor}-like floor dropped)",
           file=sys.stderr)
-    return saved, reason
+    return saved, total, reason
 
 
 def try_auto_refresh_with_backoff(account: str) -> bool:
@@ -346,9 +352,9 @@ def main():
 
         t0 = time.time()
         try:
-            saved, reason = run_once(term, args.floor, args.max_pages,
-                                     args.sort_type, args.publish_time,
-                                     account=account)
+            saved, total, reason = run_once(term, args.floor, args.max_pages,
+                                            args.sort_type, args.publish_time,
+                                            account=account)
         except WebKeywordBlocked as e:
             print(f"[blocked] {keyword!r}: {e} — marking done(0), continuing",
                   file=sys.stderr)
@@ -434,23 +440,30 @@ def main():
 
         consecutive_rejects = 0
         consecutive_errors = 0
-        if saved == 0:
+        elapsed = time.time() - t0
+
+        if saved == 0 and total == 0:
+            # Suspected cookie rot: API returned zero raw items. Release back
+            # to pending (don't burn the term as done(0)) and don't ntfy —
+            # the per-term notification is noise until we know the cookie is
+            # actually broken. Halt + auto-refresh once threshold trips.
             consecutive_zero_results += 1
+            print(f"[zero] {keyword!r}: 0 raw items "
+                  f"(consecutive={consecutive_zero_results}/{ZERO_RESULT_HALT_THRESHOLD}) "
+                  f"reason={reason}", file=sys.stderr)
+            release_term(claimed_id)
+            claimed_id = None
+
             if consecutive_zero_results >= ZERO_RESULT_HALT_THRESHOLD:
-                # Cookie soft-revoked: TikTok returns HTTP 200 with empty
-                # item_list (login wall). Release the current term back to
-                # pending so it gets retried with the new cookie.
                 print(f"[auto-refresh] {consecutive_zero_results} consecutive zero-result "
                       "terms — attempting silent cookie refresh", file=sys.stderr)
-                release_term(claimed_id)
-                claimed_id = None
                 if try_auto_refresh_with_backoff(account):
                     consecutive_zero_results = 0
                     time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
                     continue
 
                 msg = (f"Web scraper halting: {consecutive_zero_results} consecutive "
-                       f"terms returned 0 saved videos and auto-refresh failed after "
+                       f"terms returned 0 raw items and auto-refresh failed after "
                        f"backoff. Login needed: VNC into VPS and run "
                        f"`refresh_web_cookie.py --account {account} --fresh`. "
                        f"Last term: {keyword!r}.")
@@ -458,16 +471,21 @@ def main():
                 ntfy(msg, title="TikTok web scraper: login required",
                      priority="high", account=account)
                 sys.exit(1)
-        else:
-            consecutive_zero_results = 0
 
-        elapsed = time.time() - t0
+            time.sleep(random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX))
+            continue
+
+        # API returned items (total>0). Either we saved some, or all were
+        # below the like floor — both are legitimate "this term is done"
+        # outcomes; cookie is healthy.
+        consecutive_zero_results = 0
         mark_term_done(claimed_id, saved)
         claimed_id = None
-        print(f"[done] {keyword!r} saved={saved} reason={reason} elapsed={elapsed:.1f}s",
-              file=sys.stderr)
-        ntfy(f"{keyword!r}: saved {saved} videos ({reason}, {elapsed:.0f}s)",
-             title=f"TikTok web: {keyword}", account=account)
+        print(f"[done] {keyword!r} saved={saved} total={total} reason={reason} "
+              f"elapsed={elapsed:.1f}s", file=sys.stderr)
+        if saved > 0:
+            ntfy(f"{keyword!r}: saved {saved} videos ({reason}, {elapsed:.0f}s)",
+                 title=f"TikTok web: {keyword}", account=account)
 
         pause = random.uniform(INTER_TERM_SLEEP_MIN, INTER_TERM_SLEEP_MAX)
         print(f"[sleep] {pause:.1f}s before next term", file=sys.stderr)
