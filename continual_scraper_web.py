@@ -17,11 +17,17 @@ import datetime as dt
 import os
 import random
 import signal
+import socket
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
+
+# Short hostname (e.g. "again1" from "again1.us-east4-b.c.PROJECT.internal").
+# Goes into the ntfy prefix so notifications from a multi-VM fleet name the
+# physical box — useful when one of N identical-looking units halts.
+HOSTNAME = socket.gethostname().split(".", 1)[0]
 
 from db import (
     claim_next_term,
@@ -140,10 +146,10 @@ def seconds_until_next_utc_midnight(jitter_max: int = 600) -> int:
 
 def ntfy(message: str, *, title: str | None = None, priority: str | None = None,
          account: str | None = None) -> None:
-    """Per-account ntfy. Adds [<account>] prefix so multiple workers'
-    notifications are distinguishable on the phone."""
+    """Per-account ntfy. Adds [<host>/<account>] prefix so notifications from
+    a multi-VM fleet identify both the physical box and the account."""
     try:
-        prefix = f"[{account}]" if account else "[web]"
+        prefix = f"[{HOSTNAME}/{account}]" if account else f"[{HOSTNAME}]"
         message = f"{prefix} {message}"
         if title:
             title = f"{prefix} {title}"
