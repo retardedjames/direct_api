@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Per-account browser cookies + Chromium profiles for the web-search scraper.
 # Each account has its own dir under accounts/<name>/ — both cookie.py

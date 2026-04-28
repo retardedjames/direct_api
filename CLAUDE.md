@@ -92,31 +92,64 @@ When a new VM joins the fleet, append a row here.
 
 ## Bring-up runbook for a new per-account VPS
 
-Spin up any Linux x86_64 VM (GCP, AWS, etc.) — the Oracle VPS itself is
-ARM64 and our reference, but the GCP boxes have been x86_64 and that's
-fine.
+There's a "clean base" GCP machine image (snapshotted from
+`34.125.117.136` / `again2` after the cleanup on 2026-04-27) that has
+all of the platform pre-installed: venv with deps, playwright chromium
+binary cached, systemd template, linger enabled, VNC :1 configured,
+xfce4. Spin up a new VM from that image and the bring-up is one
+script + one VNC login.
 
-**1. Provision auth.** Add `~/.ssh/jamescvermont.pub` to the VM's
-`~/.ssh/authorized_keys` for user `jamescvermont`. Make sure
-passwordless sudo is set up.
+### Fast path — VM cloned from the clean base image
+
+```bash
+ssh -i ~/.ssh/jamescvermont jamescvermont@<vm-ip>
+cd ~/direct_api
+./bringup_clone.sh --account <name>
+```
+
+The script: refuses to run if the image isn't clean, pulls latest
+main, creates `accounts/<name>/`, makes sure VNC :1 is up, launches
+`refresh_web_cookie.py --fresh` under tmux on `DISPLAY=:1`, then
+prints the SSH-tunnel + VNC + ready-file + enable-service commands
+you still need to run manually (those need a human at the keyboard).
+
+After the script finishes printing instructions:
+
+1. `ssh -i ~/.ssh/jamescvermont -L 5901:localhost:5901 jamescvermont@<vm-ip>`
+2. VNC viewer → `localhost:5901`, log in to the dedicated TikTok
+   account, do one search to warm cookies.
+3. `touch /tmp/refresh_web_cookie.<name>.ready` on the VM.
+4. `tmux attach -t login` until you see
+   `[refresh] wrote .../accounts/<name>/cookie.py` → `[verify] OK` → `[refresh] done.`
+5. `systemctl --user enable --now tiktok-web-scraper@<name>.service`
+6. Append the VM to the Fleet roster in this file.
+
+### Slow path — provisioning a brand-new VM from a stock image
+
+Use this when there's no clean base image to clone (or when migrating
+to a different distro / region). Spin up any Linux x86_64 VM.
+
+**1. Provision auth.** Add `~/.ssh/jamescvermont.pub` to
+`~/.ssh/authorized_keys` for user `jamescvermont`. Passwordless sudo.
 
 **2. Install system packages:**
 ```bash
 sudo apt update && sudo apt install -y \
     python3-venv git tigervnc-standalone-server xfce4 \
-    dbus-x11 chromium-browser
+    dbus-x11 tmux
 ```
 
 **3. Clone repo + venv:**
 ```bash
 cd ~ && git clone <direct_api remote> direct_api
 cd direct_api
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
+python3 -m venv .venv
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install sqlalchemy psycopg2-binary playwright playwright-stealth
+.venv/bin/playwright install chromium
 ```
 
-**4. Start TigerVNC (localhost-only):** put this in `~/.vnc/xstartup`:
+**4. TigerVNC (localhost-only):** put this in `~/.vnc/xstartup`:
 ```bash
 #!/bin/sh
 unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
@@ -128,58 +161,26 @@ chmod +x ~/.vnc/xstartup
 vncpasswd          # set the VNC password
 vncserver :1 -geometry 1280x800 -depth 24 -localhost yes
 ```
-(`-localhost yes` binds 5901 to 127.0.0.1 only — anyone scanning the
-public IP sees nothing. Reach it from your laptop with an SSH tunnel,
-see step 6.)
+(`-localhost yes` binds 5901 to 127.0.0.1 only.)
 
-**5. Install the systemd template** (already in the repo — symlink or
-copy `tiktok-web-scraper@.service` to `~/.config/systemd/user/`):
+**5. Install systemd template + enable linger:**
 ```bash
 mkdir -p ~/.config/systemd/user
 cp ~/direct_api/tiktok-web-scraper@.service ~/.config/systemd/user/
 systemctl --user daemon-reload
-loginctl enable-linger jamescvermont   # so user units survive logout
+loginctl enable-linger jamescvermont
 ```
 
-**6. Fresh login flow** (this is what gets the cookie):
-
-Inside an SSH session on the VM:
+**6. Run the bringup script:**
 ```bash
 cd ~/direct_api
-tmux new-session -d -s login \
-  "DISPLAY=:1 XAUTHORITY=$HOME/.Xauthority \
-   .venv/bin/python refresh_web_cookie.py --account <name> --fresh \
-   2>&1 | tee /tmp/refresh.log"
+./bringup_clone.sh --account <name>
 ```
+Then follow the printed instructions (steps 1-6 of the fast path).
 
-In a separate terminal on your laptop, open the SSH tunnel:
-```bash
-ssh -i ~/.ssh/jamescvermont -L 5901:localhost:5901 jamescvermont@<vm-ip>
-```
-
-In your VNC viewer connect to `localhost:5901`. A Chromium window is
-already open at `tiktok.com`. Log in to the dedicated TikTok account for
-this VM, do any search to warm cookies. Back in any SSH session:
-```bash
-touch /tmp/refresh_web_cookie.<name>.ready
-```
-**Note the per-account suffix** — the script writes the exact path to
-the log; check there if unsure. Watch with `tmux attach -t login`. You
-want to see:
-```
-[refresh] wrote .../accounts/<name>/cookie.py (N cookies, ...)
-[verify] OK
-[refresh] done.
-```
-
-**7. Enable + start the unit:**
-```bash
-systemctl --user enable --now tiktok-web-scraper@<name>.service
-journalctl --user -u tiktok-web-scraper@<name>.service -f
-```
-You should see `status_code=0` lines and `[done] '<keyword>' saved=N`.
-
-**8. Append the VM to the fleet roster** in this file.
+**7. (Optional) Snapshot this VM as a new clean base image** —
+before running the bringup script. That way you only do steps 1-5
+once and every future account is the fast path.
 
 ## Cookie lifecycle (the heart of the system)
 
