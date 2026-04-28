@@ -59,6 +59,12 @@ echo "[bringup] git pull..."
 git fetch origin --quiet
 git reset --hard origin/main >/dev/null
 
+# Defensive: the direct-api-clean-base image was snapshotted with an
+# incomplete venv (missed brotli). Re-running pip install on every clone
+# is cheap when deps are already present, and repairs any drift.
+echo "[bringup] reconciling venv against requirements.txt..."
+.venv/bin/pip install -q -r requirements.txt
+
 mkdir -p "accounts/$ACCOUNT"
 
 tmux kill-session -t login 2>/dev/null || true

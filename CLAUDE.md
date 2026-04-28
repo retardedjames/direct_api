@@ -87,8 +87,17 @@ just `24`.
 | `150.136.40.239` (Oracle ARM64, Ubuntu 24.04) | `ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239` | `20mythoughts`, `21mythoughts`, `23mythoughts` | Also hosts Postgres + ntfy. VNC `:5901`, password `james`, **publicly reachable**. |
 | `34.148.104.145` (GCP us-east1-c, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.148.104.145` | `24` | Hostname `try2`. Xtigervnc `:1` / 5901, **localhost-only** (`-localhost=1`) — SSH-tunnel `-L 5901:localhost:5901` to reach it. |
 | `34.182.184.254` (GCP us-east4-b, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.182.184.254` | `25` | Hostname `again1`. Same VNC pattern (localhost-only, SSH-tunnel). Cloned from `try2`, so its initial `accounts/24/` was wiped during bring-up. |
+| `34.174.48.214` (GCP us-south1-a, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.174.48.214` | `27` | Hostname `dallas1`. Cloned from the `direct-api-clean-base` image (snapshotted from again2 on 2026-04-27). TikTok blocked signup from this Dallas IP; cookie was imported from a session captured elsewhere. Scraping works fine on the imported cookie despite the signup flag. |
 
 When a new VM joins the fleet, append a row here.
+
+**Image:** `direct-api-clean-base` (family `direct-api-scraper`) — snapshot
+of `again2` after platform cleanup. Has venv + playwright chromium cached
++ systemd template + linger + VNC :1, but **lacks `brotli`** in the venv
+(was missed during cleanup; `requirements.txt` now pins it). `bringup_clone.sh`
+re-runs `pip install -r requirements.txt` on each clone to repair this; if
+you skip the bringup script you'll need to do it manually before the verify
+step works.
 
 ## Bring-up runbook for a new per-account VPS
 
