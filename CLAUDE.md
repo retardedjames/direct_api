@@ -145,9 +145,12 @@ cd ~ && git clone <direct_api remote> direct_api
 cd direct_api
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install sqlalchemy psycopg2-binary playwright playwright-stealth
+.venv/bin/pip install -r requirements.txt
 .venv/bin/playwright install chromium
 ```
+
+`requirements.txt` pins `brotli` (TikTok responses are br-encoded — without it
+`scrape_keyword_web` blows up at import time), plus playwright/sqlalchemy/psycopg2.
 
 **4. TigerVNC (localhost-only):** put this in `~/.vnc/xstartup`:
 ```bash

@@ -1,0 +1,5 @@
+brotli==1.2.0
+playwright==1.58.0
+playwright-stealth==2.0.3
+psycopg2-binary==2.9.12
+SQLAlchemy==2.0.49
