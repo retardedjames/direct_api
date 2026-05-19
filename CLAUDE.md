@@ -34,23 +34,24 @@ quota; all of them write into the same shared Postgres.
                 │   └─ tiktok-web-scraper@{20,21,23}mythoughts.service
                 │       (also runs scrapers locally)       │
                 └──────────────────────────────────────────┘
-                       ▲             ▲             ▲
-                       │ writes      │ writes      │ writes
-                       │ to Postgres │ to Postgres │ to Postgres
-                       │             │             │
-   ┌───────────────────┴───┐ ┌───────┴───────┐ ┌───┴────────┐
-   │ GCP VM 34.148.104.145 │ │  GCP VM ...   │ │  GCP VM …  │
-   │  account=24           │ │  account=25   │ │  account=… │
-   │  jamescvermont@...    │ │               │ │            │
-   │                       │ │               │ │            │
-   │  Xtigervnc :1 / 5901  │ │ same pattern  │ │ same       │
-   │  (localhost-only —    │ │               │ │            │
-   │   SSH-tunnel to       │ │               │ │            │
-   │   reach it)           │ │               │ │            │
-   │  systemd --user:      │ │               │ │            │
-   │  tiktok-web-scraper@24│ │               │ │            │
-   └───────────────────────┘ └───────────────┘ └────────────┘
+                       ▲
+                       │ writes
+                       │ to Postgres
+                       │
+   ┌───────────────────┴────────────┐
+   │ Per-account satellite VPS      │
+   │  account=<name>                │
+   │  Xtigervnc :1 / 5901           │
+   │  systemd --user:               │
+   │  tiktok-web-scraper@<name>     │
+   └────────────────────────────────┘
 ```
+
+The previous GCP satellite fleet (`try2 34.148.104.145` / `again1
+34.182.184.254` / `dallas1 34.174.48.214`, accounts `24`/`25`/`27`) and
+the `direct-api-clean-base` GCP machine image are **gone** as of
+2026-05-18. Bring-ups now use the slow path on whatever VPS is
+available; see the fleet roster below.
 
 The web API is unsigned — a valid `sid_guard` + `msToken` cookie pair is
 all you need.
@@ -77,61 +78,25 @@ The original family on the Oracle VPS used `20mythoughts`, `21mythoughts`,
 consistent: the directory `accounts/<name>/`, the systemd unit
 `tiktok-web-scraper@<name>.service`, the refresh ready-file
 `/tmp/refresh_web_cookie.<name>.ready`, and the value of `--account`
-must all use the same string. The most recent VM (34.148.104.145) uses
-just `24`.
+must all use the same string.
 
-## Fleet roster
+## Fleet roster (2026-05-18)
 
 | VM | SSH | Account(s) | Notes |
 |---|---|---|---|
 | `150.136.40.239` (Oracle ARM64, Ubuntu 24.04) | `ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239` | `20mythoughts`, `21mythoughts`, `23mythoughts` | Also hosts Postgres + ntfy. VNC `:5901`, password `james`, **publicly reachable**. |
-| `34.148.104.145` (GCP us-east1-c, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.148.104.145` | `24` | Hostname `try2`. Xtigervnc `:1` / 5901, **localhost-only** (`-localhost=1`) — SSH-tunnel `-L 5901:localhost:5901` to reach it. |
-| `34.182.184.254` (GCP us-east4-b, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.182.184.254` | `25` | Hostname `again1`. Same VNC pattern (localhost-only, SSH-tunnel). Cloned from `try2`, so its initial `accounts/24/` was wiped during bring-up. |
-| `34.174.48.214` (GCP us-south1-a, x86_64) | `ssh -i ~/.ssh/jamescvermont jamescvermont@34.174.48.214` | `27` | Hostname `dallas1`. Cloned from the `direct-api-clean-base` image (snapshotted from again2 on 2026-04-27). TikTok blocked signup from this Dallas IP; cookie was imported from a session captured elsewhere. Scraping works fine on the imported cookie despite the signup flag. |
+| `95.217.215.96` (Hetzner cx23 Helsinki, x86_64) | `ssh -i ~/.ssh/hetzner_key root@95.217.215.96` | _placeholder, login TBD_ | 2 vCPU / 4 GB RAM — large enough for headed Chromium. Also runs the Piped `yt-proxy-hel` workload. |
+| `35.209.37.192` (GCP yt-proxy-us1, e2-micro) | `ssh -i ~/.ssh/google_compute_engine james@35.209.37.192` | — | **Not bootstrapped:** 1 GB RAM is too small for headed Chromium + Playwright. |
+| `34.138.158.255` (GCP instance-1, e2-micro) | `ssh -i ~/.ssh/claude_key ubuntu@34.138.158.255` | — | **Not bootstrapped:** 1 GB RAM, same constraint. |
+| `100.48.8.98` (AWS yt-proxy-aws-us, t2.micro) | `ssh -i ~/.ssh/id_ed25519 ubuntu@100.48.8.98` (must chmod 600 the key) | — | **Not bootstrapped:** 1 GB RAM, same constraint. AWS instance `i-04efe2a38e1df774f`, key-pair `boombox-james`; new instance launched 2026-05-18 (old IP 54.145.145.26 was retired). |
 
 When a new VM joins the fleet, append a row here.
 
-**Image:** `direct-api-clean-base` (family `direct-api-scraper`) — snapshot
-of `again2` after platform cleanup. Has venv + playwright chromium cached
-+ systemd template + linger + VNC :1, but **lacks `brotli`** in the venv
-(was missed during cleanup; `requirements.txt` now pins it). `bringup_clone.sh`
-re-runs `pip install -r requirements.txt` on each clone to repair this; if
-you skip the bringup script you'll need to do it manually before the verify
-step works.
-
 ## Bring-up runbook for a new per-account VPS
 
-There's a "clean base" GCP machine image (snapshotted from
-`34.125.117.136` / `again2` after the cleanup on 2026-04-27) that has
-all of the platform pre-installed: venv with deps, playwright chromium
-binary cached, systemd template, linger enabled, VNC :1 configured,
-xfce4. Spin up a new VM from that image and the bring-up is one
-script + one VNC login.
-
-### Fast path — VM cloned from the clean base image
-
-```bash
-ssh -i ~/.ssh/jamescvermont jamescvermont@<vm-ip>
-cd ~/direct_api
-./bringup_clone.sh --account <name>
-```
-
-The script: refuses to run if the image isn't clean, pulls latest
-main, creates `accounts/<name>/`, makes sure VNC :1 is up, launches
-`refresh_web_cookie.py --fresh` under tmux on `DISPLAY=:1`, then
-prints the SSH-tunnel + VNC + ready-file + enable-service commands
-you still need to run manually (those need a human at the keyboard).
-
-After the script finishes printing instructions:
-
-1. `ssh -i ~/.ssh/jamescvermont -L 5901:localhost:5901 jamescvermont@<vm-ip>`
-2. VNC viewer → `localhost:5901`, log in to the dedicated TikTok
-   account, do one search to warm cookies.
-3. `touch /tmp/refresh_web_cookie.<name>.ready` on the VM.
-4. `tmux attach -t login` until you see
-   `[refresh] wrote .../accounts/<name>/cookie.py` → `[verify] OK` → `[refresh] done.`
-5. `systemctl --user enable --now tiktok-web-scraper@<name>.service`
-6. Append the VM to the Fleet roster in this file.
+The old `direct-api-clean-base` GCP image is gone (it was snapshotted
+from a GCP instance that no longer exists). `bringup_clone.sh` will not
+work without that image — use the slow path below.
 
 ### Slow path — provisioning a brand-new VM from a stock image
 
@@ -278,8 +243,8 @@ All gitignored.
 
 ```bash
 # Watch a specific account's scraper (replace VM + account name)
-ssh -i ~/.ssh/jamescvermont jamescvermont@34.148.104.145 \
-    'journalctl --user -u tiktok-web-scraper@24.service -f'
+ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239 \
+    'journalctl --user -u tiktok-web-scraper@20mythoughts.service -f'
 
 # Queue health (run from any VM, or laptop, since DB is remote-friendly)
 ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239 \
@@ -295,8 +260,8 @@ with engine.begin() as c:
 #  WHERE status='failed' AND completed_at > now() - interval '90 minutes';
 
 # Service control on a given VM (substitute account name)
-systemctl --user restart tiktok-web-scraper@24.service
-systemctl --user status  tiktok-web-scraper@24.service
+systemctl --user restart tiktok-web-scraper@<name>.service
+systemctl --user status  tiktok-web-scraper@<name>.service
 
 # List every scraper unit on a VM
 systemctl --user list-units 'tiktok-web-scraper@*' --all --no-pager
