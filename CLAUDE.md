@@ -85,79 +85,128 @@ must all use the same string.
 | VM | SSH | Account(s) | Notes |
 |---|---|---|---|
 | `150.136.40.239` (Oracle ARM64, Ubuntu 24.04) | `ssh -i ~/.ssh/id_rsa ubuntu@150.136.40.239` | `20mythoughts`, `21mythoughts`, `23mythoughts` | Also hosts Postgres + ntfy. VNC `:5901`, password `james`, **publicly reachable**. |
-| `95.217.215.96` (Hetzner cx23 Helsinki, x86_64) | `ssh -i ~/.ssh/hetzner_key root@95.217.215.96` | _placeholder, login TBD_ | 2 vCPU / 4 GB RAM — large enough for headed Chromium. Also runs the Piped `yt-proxy-hel` workload. |
-| `35.209.37.192` (GCP yt-proxy-us1, e2-micro) | `ssh -i ~/.ssh/google_compute_engine james@35.209.37.192` | — | **Not bootstrapped:** 1 GB RAM is too small for headed Chromium + Playwright. |
-| `34.138.158.255` (GCP instance-1, e2-micro) | `ssh -i ~/.ssh/claude_key ubuntu@34.138.158.255` | — | **Not bootstrapped:** 1 GB RAM, same constraint. |
-| `100.48.8.98` (AWS yt-proxy-aws-us, t2.micro) | `ssh -i ~/.ssh/id_ed25519 ubuntu@100.48.8.98` (must chmod 600 the key) | — | **Not bootstrapped:** 1 GB RAM, same constraint. AWS instance `i-04efe2a38e1df774f`, key-pair `boombox-james`; new instance launched 2026-05-18 (old IP 54.145.145.26 was retired). |
+| `95.217.215.96` (Hetzner cx23 Helsinki, x86_64) | `ssh -i ~/.ssh/hetzner_key root@95.217.215.96` | `28` | Lean install (no VNC, no Xvfb, no headed Chromium). Scraper resident memory ~46 MB. Also runs the Piped `yt-proxy-hel` workload. |
+| `35.209.37.192` (GCP yt-proxy-us1, e2-micro) | `ssh -i ~/.ssh/google_compute_engine james@35.209.37.192` | — | Not bootstrapped (1 GB RAM is fine in principle since lean install is tiny, but no account assigned yet). |
+| `34.138.158.255` (GCP instance-1, e2-micro) | `ssh -i ~/.ssh/claude_key ubuntu@34.138.158.255` | — | Same — could host an account on the lean install. |
+| `100.48.8.98` (AWS yt-proxy-aws-us, t2.micro) | `ssh -i ~/.ssh/id_ed25519 ubuntu@100.48.8.98` (must chmod 600 the key) | — | Same. AWS instance `i-04efe2a38e1df774f`, key-pair `boombox-james`; new instance launched 2026-05-18 (old IP 54.145.145.26 was retired). **AWS public IP changes on stop/start.** |
 
 When a new VM joins the fleet, append a row here.
 
-## Bring-up runbook for a new per-account VPS
+## Bring-up runbook — lean cookie-import flow (current path)
 
-The old `direct-api-clean-base` GCP image is gone (it was snapshotted
-from a GCP instance that no longer exists). `bringup_clone.sh` will not
-work without that image — use the slow path below.
+This is the path verified on Hetzner 2026-05-18. The scraper itself is
+pure `urllib.request` (no Playwright, no browser), so a satellite VM
+needs no display server, no Chromium, no xfce4 — just Python + the repo.
+The only piece that ever needed a browser was `refresh_web_cookie.py`,
+and we replace that with a one-time cookie import from a logged-in
+browser.
 
-### Slow path — provisioning a brand-new VM from a stock image
+**1. Provision auth.** Whatever user you want; passwordless sudo or root.
 
-Use this when there's no clean base image to clone (or when migrating
-to a different distro / region). Spin up any Linux x86_64 VM.
-
-**1. Provision auth.** Add `~/.ssh/jamescvermont.pub` to
-`~/.ssh/authorized_keys` for user `jamescvermont`. Passwordless sudo.
-
-**2. Install system packages:**
+**2. Install system packages (lean):**
 ```bash
-sudo apt update && sudo apt install -y \
-    python3-venv git tigervnc-standalone-server xfce4 \
-    dbus-x11 tmux
+sudo apt update && sudo apt install -y python3-venv git
 ```
 
 **3. Clone repo + venv:**
 ```bash
-cd ~ && git clone <direct_api remote> direct_api
+cd ~ && git clone https://github.com/retardedjames/direct_api.git
 cd direct_api
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
-.venv/bin/playwright install chromium
 ```
+Skip `playwright install chromium` — we don't launch a browser on the VM.
 
 `requirements.txt` pins `brotli` (TikTok responses are br-encoded — without it
-`scrape_keyword_web` blows up at import time), plus playwright/sqlalchemy/psycopg2.
+`scrape_keyword_web` blows up at import time), plus sqlalchemy/psycopg2.
+Playwright is listed but never imported by the scraper; can be removed
+from requirements.txt if you want a smaller install.
 
-**4. TigerVNC (localhost-only):** put this in `~/.vnc/xstartup`:
-```bash
-#!/bin/sh
-unset SESSION_MANAGER DBUS_SESSION_BUS_ADDRESS
-exec startxfce4
-```
-Then:
-```bash
-chmod +x ~/.vnc/xstartup
-vncpasswd          # set the VNC password
-vncserver :1 -geometry 1280x800 -depth 24 -localhost yes
-```
-(`-localhost yes` binds 5901 to 127.0.0.1 only.)
+**4. Import cookies from a browser where you're already logged in:**
 
-**5. Install systemd template + enable linger:**
-```bash
-mkdir -p ~/.config/systemd/user
-cp ~/direct_api/tiktok-web-scraper@.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-loginctl enable-linger jamescvermont
-```
+On your laptop, open `www.tiktok.com` in any browser logged into the
+target account. Either:
+- DevTools → Network → reload → click any `www.tiktok.com` request →
+  copy the full `cookie:` request header and the `user-agent:` request
+  header; or
+- Use the **Cookie-Editor** extension → "Export → JSON" — Claude can
+  convert that JSON to the header-string format.
 
-**6. Run the bringup script:**
+`dallas1` precedent confirms cookies transfer across IPs — you do NOT
+need to log in *from* the satellite VM's IP. If a cookie ever does get
+rejected after transfer, fall back to the SSH SOCKS5 variant (see "If
+imported cookies are rejected" below).
+
+Write `accounts/<name>/cookie.py`:
+```python
+COOKIE = "ttwid=...; sid_guard=...; sessionid=...; msToken=..."  # full cookie header
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36")
+```
+`scrape_keyword_web` extracts the **last** `msToken=` value from the
+cookie string, so when multiple are present, order the longer-lived one
+last.
+
+**5. Verify the cookie:**
 ```bash
 cd ~/direct_api
-./bringup_clone.sh --account <name>
+.venv/bin/python scrape_keyword_web.py mario --account <name> --no-db
 ```
-Then follow the printed instructions (steps 1-6 of the fast path).
+Expect `[page 0] items=30 has_more=1 status_code=0`. Anything else and
+the cookie was rejected.
 
-**7. (Optional) Snapshot this VM as a new clean base image** —
-before running the bringup script. That way you only do steps 1-5
-once and every future account is the fast path.
+**6. Install systemd template + enable linger:**
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/tiktok-web-scraper@.service <<'EOF'
+[Unit]
+Description=TikTok web-search scraper (account=%i)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=%h/direct_api
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/direct_api/.venv/bin/python %h/direct_api/continual_scraper_web.py --account %i
+Restart=on-failure
+RestartSec=60s
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+loginctl enable-linger $USER
+systemctl --user enable --now tiktok-web-scraper@<name>.service
+journalctl --user -u tiktok-web-scraper@<name>.service -f
+```
+No `Environment=DISPLAY=` — the scraper is headless.
+
+**If imported cookies are rejected** (TikTok IP-binds the session):
+SOCKS-tunnel through the VM and re-log-in:
+```
+# On laptop:
+ssh -D 1080 -N -i <vm-key> <user>@<vm-ip>
+# In Firefox: Settings → SOCKS5 127.0.0.1:1080, "Proxy DNS over SOCKS5"
+# Confirm ifconfig.me shows the VM's IP, log into TikTok, re-export cookies.
+```
+
+**Auto-refresh:** the lean install drops `refresh_web_cookie.py`'s
+auto-recovery path (it needs Playwright + a display + a saved profile).
+When cookies rot, the scraper ntfys "login required" and you re-import
+manually. On Oracle (legacy installation) the headed/VNC flow is still
+present.
+
+## Oracle-specific legacy notes
+
+Oracle (`150.136.40.239`) still has the old setup: Xtigervnc on `:5901`
++ xfce4 + headed Chromium + saved Playwright profile, and the systemd
+unit there carries `Environment=DISPLAY=:1`. Auto-refresh works there.
+When that VM eventually needs reinstall, switch it to the lean flow
+above.
 
 ## Cookie lifecycle (the heart of the system)
 
