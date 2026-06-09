@@ -1,4 +1,5 @@
 brotli==1.2.0
+boto3==1.43.25
 gender-guesser==0.4.0
 playwright==1.58.0
 playwright-stealth==2.0.3
