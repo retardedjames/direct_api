@@ -1,0 +1,12 @@
+# Extra deps for the vision pass (classify_faces.py / train_beauty_head.py).
+# Installed on the rented vast.ai GPU box, NOT on the scraper VMs.
+# Use onnxruntime-gpu on a CUDA box; swap to onnxruntime for a CPU-only run.
+insightface
+onnxruntime-gpu
+opencv-python-headless
+numpy
+scikit-learn
+scipy
+boto3
+psycopg2-binary
+Pillow
