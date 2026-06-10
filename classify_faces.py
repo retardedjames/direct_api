@@ -46,6 +46,7 @@ import argparse
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 import cv2
@@ -194,7 +195,10 @@ def main():
     ap.add_argument("--of", type=int, default=1, help="number of shards")
     ap.add_argument("--source", choices=("avatar", "cover"), default="avatar")
     ap.add_argument("--det-size", type=int, default=640)
-    ap.add_argument("--batch", type=int, default=200, help="DB commit batch size")
+    ap.add_argument("--batch", type=int, default=500, help="DB commit batch size")
+    ap.add_argument("--chunk", type=int, default=512, help="avatars fetched per round")
+    ap.add_argument("--fetch-workers", type=int, default=48,
+                    help="concurrent S3 GETs (hides network latency)")
     ap.add_argument("--beauty-head", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "beauty_head.pkl"))
     args = ap.parse_args()
@@ -213,30 +217,49 @@ def main():
     app = load_face_app(args.det_size)
     head = load_beauty_head(args.beauty_head)
 
-    rows = []
-    n_ok = n_female = n_noface = n_err = 0
-    t0 = time.time()
-    for idx, uid in enumerate(work, 1):
+    def fetch(uid):
+        """Pull one avatar's bytes. Returns (uid, bytes|None, err|None)."""
         try:
             obj = s3.get_object(Bucket=BUCKET, Key=f"{prefix}/{uid}.jpg")
-            res = classify_one(obj["Body"].read(), app, head)
+            return uid, obj["Body"].read(), None
         except Exception as e:
-            res = {"status": "error", "n_faces": 0}
-            print(f"[classify] err uid={uid}: {type(e).__name__}: {str(e)[:80]}",
-                  file=sys.stderr)
-        if res["status"] == "ok":
-            n_ok += 1
-            n_female += int(bool(res.get("vis_is_female")))
-        elif res["status"] == "noface":
-            n_noface += 1
-        else:
-            n_err += 1
-        rows.append(row_tuple(uid, args.source, res))
+            return uid, None, e
+
+    # Network latency, not GPU, is the bottleneck on a remote box: pull each
+    # chunk's avatars concurrently (latency hidden across `fetch_workers`),
+    # then run the model over the chunk. Memory stays bounded to one chunk.
+    rows = []
+    n_ok = n_female = n_noface = n_err = 0
+    done = 0
+    t0 = time.time()
+    pool = ThreadPoolExecutor(max_workers=args.fetch_workers)
+    for i in range(0, len(work), args.chunk):
+        chunk = work[i:i + args.chunk]
+        for uid, img_bytes, err in pool.map(fetch, chunk):
+            if err is not None:
+                res = {"status": "error", "n_faces": 0}
+            else:
+                try:
+                    res = classify_one(img_bytes, app, head)
+                except Exception as e:
+                    res = {"status": "error", "n_faces": 0}
+                    print(f"[classify] decode/model err uid={uid}: "
+                          f"{type(e).__name__}: {str(e)[:80]}", file=sys.stderr)
+            if res["status"] == "ok":
+                n_ok += 1
+                n_female += int(bool(res.get("vis_is_female")))
+            elif res["status"] == "noface":
+                n_noface += 1
+            else:
+                n_err += 1
+            rows.append(row_tuple(uid, args.source, res))
+            done += 1
         if len(rows) >= args.batch:
             flush(cur, conn, rows); rows = []
-            rate = idx / (time.time() - t0)
-            print(f"[classify] {idx}/{len(work)} ok={n_ok} female={n_female} "
-                  f"noface={n_noface} err={n_err} ({rate:.0f}/s)", file=sys.stderr)
+        rate = done / (time.time() - t0)
+        print(f"[classify] {done}/{len(work)} ok={n_ok} female={n_female} "
+              f"noface={n_noface} err={n_err} ({rate:.0f}/s)", file=sys.stderr)
+    pool.shutdown(wait=True)
     flush(cur, conn, rows)
     dt = time.time() - t0
     print(f"[classify] DONE {len(work)} in {dt:.0f}s | ok={n_ok} female={n_female} "
